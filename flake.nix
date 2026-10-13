@@ -21,6 +21,7 @@
           openssl
           pipewire
           alsa-lib
+          libgbm
           glib
           cairo
           pango
