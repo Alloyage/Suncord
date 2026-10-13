@@ -191,11 +191,13 @@ fn loop_capture(app: AppHandle, commands: std::sync::mpsc::Receiver<CapCmd>) {
             Duration::ZERO
         };
 
-        // Block briefly for the next WGC frame so we ride the compositor clock (~60 Hz)
-        // instead of spinning on try_recv and only counting sparse desktop updates.
+        // Wait up to one frame interval for a fresh WGC buffer. Stats only count
+        // frames that were actually dispatched to the preview encoder — not paced
+        // cursor re-emits — so the badge matches what the UI can show.
         let mut fresh = false;
         if let Some(stream) = display_stream.as_ref() {
-            if let Some(frame) = stream.wait_latest(wait.max(Duration::from_millis(1))) {
+            let timeout = wait.max(Duration::from_millis(1)).min(interval);
+            if let Some(frame) = stream.wait_latest(timeout) {
                 last_frame = Some(frame);
                 fresh = true;
             }
@@ -209,13 +211,12 @@ fn loop_capture(app: AppHandle, commands: std::sync::mpsc::Receiver<CapCmd>) {
             }
         }
 
-        // Pace emits to the target FPS. Re-ship the last buffer when WGC is quiet so
-        // the software cursor stays live without GDI fallback (which tops out ~5 FPS).
-        if !fresh && tick < next_emit {
-            continue;
-        }
         if !fresh && last_frame.is_none() {
             thread::sleep(Duration::from_millis(2));
+            continue;
+        }
+        // Cursor-only re-emit when the desktop is static, but never faster than target FPS.
+        if !fresh && tick < next_emit {
             continue;
         }
 
@@ -224,13 +225,17 @@ fn loop_capture(app: AppHandle, commands: std::sync::mpsc::Receiver<CapCmd>) {
             continue;
         };
         let (width, height, path) = encode(&preference, frame.width, frame.height);
-        bytes = bytes.saturating_add(frame.rgba.len() as u64);
         if preview_enabled {
             if preview_tx.try_send(std::sync::Arc::new(frame)).is_err() {
                 dropped = dropped.saturating_add(1);
+            } else if fresh {
+                // Only credit freshly captured buffers toward capture FPS / bitrate.
+                bytes = bytes.saturating_add((width as u64) * (height as u64) * 3 / 8);
+                frames += 1;
             }
+        } else if fresh {
+            frames += 1;
         }
-        frames += 1;
         if window_started.elapsed() >= Duration::from_secs(1) {
             let elapsed = window_started.elapsed().as_secs_f32().max(0.001);
             let measured_fps = frames as f32 / elapsed;
@@ -245,6 +250,7 @@ fn loop_capture(app: AppHandle, commands: std::sync::mpsc::Receiver<CapCmd>) {
                     source: id,
                     width,
                     height,
+                    // Placeholder — the UI overwrites this with measured display FPS.
                     fps: measured_fps,
                     capture_ms: tick.elapsed().as_secs_f32() * 1000.0,
                     dropped,
@@ -490,8 +496,8 @@ fn emit(app: &AppHandle, stats: CaptureStats) {
 }
 
 fn emit_preview(app: &AppHandle, frame: &Frame) {
-    // Compact JPEG keeps the off-thread encoder under a frame budget at 60 FPS.
-    let max_w = 720u32;
+    // 640px / q=52 keeps encode under ~12ms so the preview worker holds 60 FPS.
+    let max_w = 640u32;
     let (width, height, rgba) = if frame.width > max_w {
         let width = max_w;
         let height = ((frame.height as u64 * width as u64) / frame.width.max(1) as u64).max(2) as u32;
@@ -517,7 +523,7 @@ fn emit_preview(app: &AppHandle, frame: &Frame) {
     paint_software_cursor(&mut painted, origin_x, origin_y, scale_x, scale_y);
     let rgb = rgba_to_rgb(painted.rgba.as_ref());
     let mut jpeg = Vec::with_capacity((width * height) as usize / 6);
-    let encoder = JpegEncoder::new_with_quality(&mut jpeg, 55);
+    let encoder = JpegEncoder::new_with_quality(&mut jpeg, 52);
     if encoder
         .write_image(&rgb, width, height, ColorType::Rgb8.into())
         .is_ok()

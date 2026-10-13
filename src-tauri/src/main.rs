@@ -55,6 +55,7 @@ fn main() {
             commands::capture_start,
             commands::capture_stop,
             commands::capture_set_preview,
+            commands::fetch_attachment_text,
         ])
         .run(tauri::generate_context!())
         .expect("Suncord failed to start");

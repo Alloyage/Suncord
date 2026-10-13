@@ -650,7 +650,8 @@ fn request_voice_server(
     });
     let cmd_later = cmd_tx.clone();
     tauri::async_runtime::spawn(async move {
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        // Give VOICE_SERVER_UPDATE room to arrive before re-issuing Opcode 4.
+        tokio::time::sleep(Duration::from_secs(8)).await;
         let _ = cmd_later.send(VCmd::RetryVoiceServer { ticket });
     });
     if status.phase == "joining" || status.phase == "idle" {
@@ -762,7 +763,9 @@ async fn connect_voice(
             }
         }
     });
-    let hello = next_op(&mut read, &mut stop, &mut dave, &text_tx, 8).await?;
+    // Voice gateway v8 requires seq_ack on heartbeats; track the last numbered message.
+    let seq_ack = Arc::new(AtomicU64::new(u64::MAX)); // MAX == "no seq yet" → omit seq_ack
+    let hello = next_op(&mut read, &mut stop, &mut dave, &text_tx, &seq_ack, 8).await?;
     let interval = hello
         .pointer("/d/heartbeat_interval")
         .and_then(|value| {
@@ -772,13 +775,22 @@ async fn connect_voice(
         })
         .unwrap_or(41_250);
     let heartbeat_tx = text_tx.clone();
+    let heartbeat_seq = seq_ack.clone();
     let heartbeat = tokio::spawn(async move {
-        let mut nonce = 0u64;
-        // Heartbeat immediately — Discord closes voice sockets that wait a full interval
-        // before the first Opcode 3 during Identify/Ready.
+        // Voice gateway v8: Opcode 3 must be `{ t, seq_ack? }` — a bare integer nonce
+        // is rejected and the media server later closes the session (often as 4006).
         loop {
-            nonce = nonce.wrapping_add(1);
-            let payload = json!({ "op": 3, "d": nonce }).to_string();
+            let t = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            let last = heartbeat_seq.load(Ordering::Relaxed);
+            let payload = if last == u64::MAX {
+                json!({ "op": 3, "d": { "t": t } })
+            } else {
+                json!({ "op": 3, "d": { "t": t, "seq_ack": last } })
+            }
+            .to_string();
             if heartbeat_tx.send(payload).is_err() {
                 break;
             }
@@ -789,7 +801,7 @@ async fn connect_voice(
         return Err("Voice identify is missing user, session, or token.".into());
     }
     // Discord media servers close with 4017 when max_dave_protocol_version is 0/omitted.
-    // Advertise DAVE v1 so the handshake can negotiate transport + optional MLS.
+    // Advertise DAVE v1 so E2EE-required channels accept the handshake.
     let identify = json!({
         "op": 0,
         "d": {
@@ -797,8 +809,6 @@ async fn connect_voice(
             "user_id": args.user_id,
             "session_id": args.session_id,
             "token": args.token,
-            "video": false,
-            "streams": [],
             "max_dave_protocol_version": DaveSession::VERSION
         }
     });
@@ -812,7 +822,7 @@ async fn connect_voice(
         &args.session_id[..args.session_id.len().min(8)],
         DaveSession::VERSION
     );
-    let ready = next_op(&mut read, &mut stop, &mut dave, &text_tx, 2).await?;
+    let ready = next_op(&mut read, &mut stop, &mut dave, &text_tx, &seq_ack, 2).await?;
     log::info!(
         "voice Ready ssrc={} {}:{}",
         ready["d"]["ssrc"],
@@ -833,11 +843,30 @@ async fn connect_voice(
         .await
         .map_err(|err| err.to_string())?;
     let mut discovery = [0u8; 74];
-    let read_discovery = tokio::time::timeout(Duration::from_secs(5), udp.recv(&mut discovery));
-    tokio::select! {
-        _ = &mut stop => return Err("left voice".into()),
-        result = read_discovery => {
-            result.map_err(|_| "IP discovery timed out".to_string())?.map_err(|err| err.to_string())?;
+    // Keep reading the voice WS while waiting on UDP so DAVE/seq heartbeats stay live.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        tokio::select! {
+            _ = &mut stop => return Err("left voice".into()),
+            result = udp.recv(&mut discovery) => {
+                result.map_err(|err| err.to_string())?;
+                break;
+            }
+            message = read.next() => {
+                let message = message
+                    .ok_or_else(|| "voice socket closed".to_string())?
+                    .map_err(|err| format!("voice websocket error: {err}"))?;
+                if let Message::Close(frame) = &message {
+                    return Err(close_error(frame));
+                }
+                note_seq(&seq_ack, &message, &mut dave);
+                for reply in dave_replies(&mut dave, message) {
+                    let _ = text_tx.send(reply);
+                }
+            }
+            _ = tokio::time::sleep_until(deadline) => {
+                return Err("IP discovery timed out".into());
+            }
         }
     }
     let (address, port) =
@@ -857,7 +886,7 @@ async fn connect_voice(
     text_tx
         .send(select.to_string())
         .map_err(|_| "voice socket closed before SELECT".to_string())?;
-    let described = next_op(&mut read, &mut stop, &mut dave, &text_tx, 4).await?;
+    let described = next_op(&mut read, &mut stop, &mut dave, &text_tx, &seq_ack, 4).await?;
     let described: SessionDescription =
         serde_json::from_value(described["d"].clone()).map_err(|err| err.to_string())?;
     if described.secret_key.len() != 32 {
@@ -927,6 +956,7 @@ async fn connect_voice(
                         return Err(close_error(&frame));
                     }
                     Some(Ok(incoming)) => {
+                        note_seq(&seq_ack, &incoming, &mut dave);
                         for reply in dave_replies(&mut dave, incoming) {
                             let _ = text_tx.send(reply);
                         }
@@ -977,11 +1007,32 @@ fn dave_replies(dave: &mut DaveSession, message: Message) -> Vec<String> {
     }
 }
 
+fn note_seq(seq_ack: &AtomicU64, message: &Message, dave: &mut DaveSession) {
+    match message {
+        Message::Text(text) => {
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(text) {
+                if let Some(seq) = value.get("seq").and_then(|seq| seq.as_u64()) {
+                    seq_ack.store(seq, Ordering::Relaxed);
+                }
+            }
+        }
+        Message::Binary(bytes) => {
+            if bytes.len() >= 3 && (21..=31).contains(&bytes[2]) {
+                let seq = u16::from_be_bytes([bytes[0], bytes[1]]) as u64;
+                seq_ack.store(seq, Ordering::Relaxed);
+                dave.seq_ack = seq as u16;
+            }
+        }
+        _ => {}
+    }
+}
+
 async fn next_op(
     read: &mut (impl StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin),
     stop: &mut oneshot::Receiver<()>,
     dave: &mut DaveSession,
     outbound: &mpsc::UnboundedSender<String>,
+    seq_ack: &AtomicU64,
     op: u64,
 ) -> Result<serde_json::Value, String> {
     loop {
@@ -994,6 +1045,7 @@ async fn next_op(
         if let Message::Close(frame) = &message {
             return Err(close_error(frame));
         }
+        note_seq(seq_ack, &message, dave);
         // Answer DAVE/MLS opcodes at any handshake stage (Ready through Session Description).
         for reply in dave_replies(dave, message.clone()) {
             let _ = outbound.send(reply);

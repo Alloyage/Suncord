@@ -172,6 +172,17 @@ function CallGrid({
   const capture = useApp((state) => state.capture);
   const shareRef = useRef<HTMLDivElement>(null);
   const [fullscreen, setFullscreen] = useState(false);
+  const [displayFps, setDisplayFps] = useState(0);
+  const reportDisplayFps = useMemo(() => {
+    let last = 0;
+    return (fps: number) => {
+      const rounded = Math.round(fps);
+      if (rounded !== last) {
+        last = rounded;
+        setDisplayFps(rounded);
+      }
+    };
+  }, []);
 
   useEffect(() => {
     const onChange = () => setFullscreen(Boolean(document.fullscreenElement));
@@ -223,8 +234,11 @@ function CallGrid({
           }`}
           onDoubleClick={() => toggleFullscreen()}
         >
-          <WebGLCapturePreview className="h-full max-h-full w-full object-contain" />
-          <CaptureTelemetryBadge stats={capture} />
+          <WebGLCapturePreview
+            className="h-full max-h-full w-full object-contain"
+            onDisplayFps={reportDisplayFps}
+          />
+          <CaptureTelemetryBadge stats={capture} displayFps={displayFps} />
           <button
             type="button"
             title={fullscreen ? "Exit full screen" : "Full screen"}
@@ -245,11 +259,14 @@ function CallGrid({
 
 function CaptureTelemetryBadge({
   stats,
+  displayFps,
 }: {
   stats: { width?: number; height?: number; fps?: number; bitrateKbps?: number } | null | undefined;
+  displayFps: number;
 }) {
   if (!stats?.width || !stats?.height) return null;
-  const fps = Math.round(stats.fps ?? 0);
+  // Prefer measured canvas draw rate over capture-side emit counts (those inflate easily).
+  const fps = Math.round(displayFps > 0 ? displayFps : stats.fps ?? 0);
   const bitrate = Math.round(stats.bitrateKbps ?? 0);
   return (
     <div className="pointer-events-none absolute left-3 top-3 rounded bg-black/70 px-2 py-1 font-mono text-[11px] tabular-nums text-cream ring-1 ring-white/10">
@@ -415,16 +432,33 @@ export function ShareSheet() {
   );
 }
 
-function WebGLCapturePreview({ className }: { className?: string }) {
+function WebGLCapturePreview({
+  className,
+  onDisplayFps,
+}: {
+  className?: string;
+  onDisplayFps?: (fps: number) => void;
+}) {
   const canvas = useRef<HTMLCanvasElement>(null);
   const latest = useRef<CaptureFrame | null>(null);
   const bitmap = useRef<ImageBitmap | null>(null);
   const dirty = useRef(false);
+  const texSize = useRef({ w: 0, h: 0 });
 
   useEffect(() => {
     const node = canvas.current;
-    const gl = node?.getContext("webgl2", { antialias: false, powerPreference: "high-performance" })
-      ?? node?.getContext("webgl", { antialias: false, powerPreference: "high-performance" });
+    const gl = node?.getContext("webgl2", {
+      antialias: false,
+      powerPreference: "high-performance",
+      preserveDrawingBuffer: false,
+      desynchronized: true,
+    })
+      ?? node?.getContext("webgl", {
+        antialias: false,
+        powerPreference: "high-performance",
+        preserveDrawingBuffer: false,
+        desynchronized: true,
+      });
     if (!node || !gl) return;
     const program = makePreviewProgram(gl);
     const texture = gl.createTexture();
@@ -433,11 +467,18 @@ function WebGLCapturePreview({ className }: { className?: string }) {
     gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
     gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
     const position = gl.getAttribLocation(program, "position");
+    gl.bindTexture(gl.TEXTURE_2D, texture);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
     let unlisten: (() => void) | undefined;
     let cancelled = false;
     let decoding = false;
     let decodeId = 0;
     let animation = 0;
+    let drawn = 0;
+    let fpsWindow = performance.now();
     const worker = createJpegDecodeWorker();
     const pumpDecode = () => {
       if (cancelled || decoding) return;
@@ -501,12 +542,21 @@ function WebGLCapturePreview({ className }: { className?: string }) {
         gl.enableVertexAttribArray(position);
         gl.vertexAttribPointer(position, 2, gl.FLOAT, false, 0, 0);
         gl.bindTexture(gl.TEXTURE_2D, texture);
-        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, image);
+        // texSubImage2D avoids realloc stutter when the preview size is stable.
+        if (texSize.current.w === image.width && texSize.current.h === image.height) {
+          gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, gl.RGBA, gl.UNSIGNED_BYTE, image);
+        } else {
+          gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, image);
+          texSize.current = { w: image.width, h: image.height };
+        }
         gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+        drawn += 1;
+        const now = performance.now();
+        if (now - fpsWindow >= 1000) {
+          onDisplayFps?.(drawn / ((now - fpsWindow) / 1000));
+          drawn = 0;
+          fpsWindow = now;
+        }
       }
       animation = requestAnimationFrame(draw);
     };
@@ -522,7 +572,7 @@ function WebGLCapturePreview({ className }: { className?: string }) {
       gl.deleteBuffer(buffer);
       gl.deleteProgram(program);
     };
-  }, []);
+  }, [onDisplayFps]);
   return <canvas ref={canvas} className={className ?? "h-full w-full object-contain"} aria-label="Screen share preview" />;
 }
 

@@ -261,6 +261,10 @@ export function setCapturePreview(enabled: boolean): Promise<void> {
   return invoke("capture_set_preview", { enabled });
 }
 
+export function fetchAttachmentText(url: string): Promise<string> {
+  return invoke<string>("fetch_attachment_text", { url });
+}
+
 export async function windowControl(action: "minimize" | "toggle" | "close"): Promise<void> {
   if (!inTauri()) return;
   const window = getCurrentWindow();

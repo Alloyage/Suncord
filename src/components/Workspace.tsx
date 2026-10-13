@@ -4,6 +4,7 @@ import {
   channelPins,
   deleteMessage,
   editMessage,
+  fetchAttachmentText,
   joinVoice,
   leaveVoice,
   openExternal,
@@ -1127,14 +1128,16 @@ function TextAttachmentPreview({ attachment, src }: { attachment: Attachment; sr
     let cancelled = false;
     setText(null);
     setError(false);
-    void fetch(src)
-      .then((response) => {
+    const url = attachment.url || src;
+    // Discord CDN blocks browser CORS — pull through the Tauri backend instead.
+    void fetchAttachmentText(url)
+      .catch(async () => {
+        const response = await fetch(src);
         if (!response.ok) throw new Error("fetch failed");
         return response.text();
       })
       .then((body) => {
         if (cancelled) return;
-        // Cap preview so huge logs stay snappy in the chat scroller.
         setText(body.length > 80_000 ? `${body.slice(0, 80_000)}\n…` : body);
       })
       .catch(() => {
@@ -1143,7 +1146,7 @@ function TextAttachmentPreview({ attachment, src }: { attachment: Attachment; sr
     return () => {
       cancelled = true;
     };
-  }, [src]);
+  }, [attachment.url, src]);
   return (
     <div className="max-w-lg overflow-hidden rounded-md border border-line bg-[#0e0e0e]">
       <div className="flex items-center justify-between gap-2 border-b border-white/5 px-3 py-1.5">
@@ -1161,8 +1164,8 @@ function TextAttachmentPreview({ attachment, src }: { attachment: Attachment; sr
       ) : text == null ? (
         <p className="px-3 py-2 text-xs text-mute">Loading preview…</p>
       ) : (
-        <pre className="max-h-64 overflow-auto whitespace-pre-wrap break-words px-3 py-2 font-mono text-[11px] leading-relaxed text-cream/90">
-          {text}
+        <pre className="max-h-72 overflow-auto whitespace-pre-wrap break-words px-3 py-2 font-mono text-[11px] leading-relaxed text-cream/90">
+          <code>{text}</code>
         </pre>
       )}
     </div>
@@ -1237,11 +1240,18 @@ function isTextAttachment(attachment: Attachment): boolean {
     type.includes("json") ||
     type.includes("xml") ||
     type.includes("javascript") ||
-    type.includes("typescript")
+    type.includes("typescript") ||
+    type.includes("octet-stream")
   ) {
+    // octet-stream still needs a text-like extension (e.g. .nix from Discord).
+    if (type.includes("octet-stream")) {
+      return /\.(nix|txt|log|md|markdown|rs|json|toml|yml|yaml|conf|cfg|ini|env|sh|ps1|bat|py|ts|tsx|js|jsx|css|html|c|cpp|h|hpp|go|java)$/i.test(
+        attachment.filename || attachment.url,
+      );
+    }
     return true;
   }
-  return /\.(txt|log|md|markdown|csv|tsv|json|xml|yml|yaml|toml|ini|cfg|conf|env|rs|ts|tsx|js|jsx|css|html|py|go|java|c|cpp|h|hpp|sh|ps1|bat)$/i.test(
+  return /\.(nix|txt|log|md|markdown|csv|tsv|json|xml|yml|yaml|toml|ini|cfg|conf|env|rs|ts|tsx|js|jsx|css|html|py|go|java|c|cpp|h|hpp|sh|ps1|bat)$/i.test(
     attachment.filename || attachment.url,
   );
 }

@@ -234,3 +234,54 @@ pub fn capture_stop(state: State<'_, AppState>) {
 pub fn capture_set_preview(state: State<'_, AppState>, enabled: bool) {
     state.capture.set_preview(enabled);
 }
+
+/// Fetch Discord CDN attachment bytes as text (bypasses WebView CORS for previews).
+#[tauri::command]
+pub async fn fetch_attachment_text(url: String) -> Result<String, String> {
+    let parsed = url::Url::parse(&url).map_err(|_| "That attachment URL is invalid.".to_string())?;
+    if parsed.scheme() != "http" && parsed.scheme() != "https" {
+        return Err("Only http(s) attachment URLs can be previewed.".into());
+    }
+    let host = parsed.host_str().unwrap_or("").to_ascii_lowercase();
+    let allowed = host == "cdn.discordapp.com"
+        || host.ends_with(".discordapp.com")
+        || host == "media.discordapp.net"
+        || host.ends_with(".discordapp.net")
+        || host == "discord.com"
+        || host.ends_with(".discord.com");
+    if !allowed {
+        return Err("Only Discord CDN attachments can be previewed.".into());
+    }
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(20))
+        .build()
+        .map_err(|err| err.to_string())?;
+    let response = client
+        .get(parsed)
+        .header(
+            reqwest::header::USER_AGENT,
+            "Mozilla/5.0 (compatible; Suncord/0.1)",
+        )
+        .send()
+        .await
+        .map_err(|err| format!("Could not download attachment: {err}"))?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "Attachment download failed (HTTP {}).",
+            response.status().as_u16()
+        ));
+    }
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|err| format!("Could not read attachment: {err}"))?;
+    if bytes.len() > 512_000 {
+        return Err("That text attachment is too large to preview.".into());
+    }
+    let text = String::from_utf8_lossy(&bytes).into_owned();
+    if text.len() > 80_000 {
+        Ok(format!("{}…", &text[..80_000]))
+    } else {
+        Ok(text)
+    }
+}
