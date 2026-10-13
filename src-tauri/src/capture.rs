@@ -116,8 +116,8 @@ fn loop_capture(app: AppHandle, commands: std::sync::mpsc::Receiver<CapCmd>) {
     let mut bytes = 0u64;
     let mut window_started = Instant::now();
     let mut next_emit = Instant::now();
-    // Preview JPEG encode runs off-thread so the capture loop can hold 60 FPS.
-    let (preview_tx, preview_rx) = std::sync::mpsc::sync_channel::<Frame>(1);
+    // Preview JPEG encode runs off-thread; capture only ships Arc frames (no 4K clone).
+    let (preview_tx, preview_rx) = std::sync::mpsc::sync_channel::<std::sync::Arc<Frame>>(1);
     let preview_app = app.clone();
     thread::Builder::new()
         .name("suncord-preview".into())
@@ -199,23 +199,29 @@ fn loop_capture(app: AppHandle, commands: std::sync::mpsc::Receiver<CapCmd>) {
         }
 
         if tick < next_emit {
-            let sleep_for = (next_emit - tick).min(Duration::from_millis(2));
-            if !sleep_for.is_zero() {
-                thread::sleep(sleep_for);
+            let remain = next_emit - tick;
+            if remain > Duration::from_millis(1) {
+                thread::sleep(remain - Duration::from_micros(200));
+            } else {
+                std::hint::spin_loop();
             }
             continue;
         }
-        next_emit = tick + interval;
+        // Steady cadence — catch up instead of drifting behind after a hitch.
+        next_emit += interval;
+        if next_emit + interval < tick {
+            next_emit = tick + interval;
+        }
 
-        let Some(frame) = last_frame.as_ref() else {
+        let Some(frame) = last_frame.clone() else {
             dropped = dropped.saturating_add(1);
             continue;
         };
-        let (width, height, path) = encode(&preference, frame.width, frame.height, &frame.rgba);
+        let (width, height, path) = encode(&preference, frame.width, frame.height);
         bytes = bytes.saturating_add(frame.rgba.len() as u64);
         if preview_enabled {
-            // Scale (+ cursor) before enqueue so we never clone a full 4K buffer at 60 FPS.
-            if preview_tx.try_send(preview_frame(frame)).is_err() {
+            // Arc clone is cheap; preview worker scales + JPEG off the capture hot path.
+            if preview_tx.try_send(std::sync::Arc::new(frame)).is_err() {
                 dropped = dropped.saturating_add(1);
             }
         }
@@ -245,10 +251,11 @@ fn loop_capture(app: AppHandle, commands: std::sync::mpsc::Receiver<CapCmd>) {
     }
 }
 
+#[derive(Clone)]
 struct Frame {
     width: u32,
     height: u32,
-    rgba: Vec<u8>,
+    rgba: std::sync::Arc<Vec<u8>>,
     origin_x: i32,
     origin_y: i32,
 }
@@ -291,7 +298,7 @@ impl NativeDisplayStream {
         Some(Frame {
             width: frame.width,
             height: frame.height,
-            rgba: frame.raw,
+            rgba: std::sync::Arc::new(frame.raw),
             origin_x: self.origin_x,
             origin_y: self.origin_y,
         })
@@ -315,7 +322,7 @@ fn grab(id: &str) -> Result<Frame, String> {
         return Ok(Frame {
             width: image.width(),
             height: image.height(),
-            rgba: image.into_raw(),
+            rgba: std::sync::Arc::new(image.into_raw()),
             origin_x,
             origin_y,
         });
@@ -333,7 +340,7 @@ fn grab(id: &str) -> Result<Frame, String> {
         return Ok(Frame {
             width: image.width(),
             height: image.height(),
-            rgba: image.into_raw(),
+            rgba: std::sync::Arc::new(image.into_raw()),
             origin_x,
             origin_y,
         });
@@ -400,6 +407,7 @@ fn paint_software_cursor(frame: &mut Frame, origin_x: i32, origin_y: i32, scale_
         (5, 11), (6, 6), (6, 8), (6, 12), (7, 7), (7, 13), (8, 8), (8, 12), (9, 9), (9, 11),
         (10, 10),
     ];
+    let pixels = std::sync::Arc::make_mut(&mut frame.rgba);
     let mut put = |px: i32, py: i32, r: u8, g: u8, b: u8| {
         if px < 0 || py < 0 {
             return;
@@ -410,13 +418,13 @@ fn paint_software_cursor(frame: &mut Frame, origin_x: i32, origin_y: i32, scale_
             return;
         }
         let idx = ((py as usize * frame.width as usize) + px as usize) * 4;
-        if idx + 3 >= frame.rgba.len() {
+        if idx + 3 >= pixels.len() {
             return;
         }
-        frame.rgba[idx] = r;
-        frame.rgba[idx + 1] = g;
-        frame.rgba[idx + 2] = b;
-        frame.rgba[idx + 3] = 255;
+        pixels[idx] = r;
+        pixels[idx + 1] = g;
+        pixels[idx + 2] = b;
+        pixels[idx + 3] = 255;
     };
     for &(dx, dy) in ARROW {
         let px = x as i32 + dx;
@@ -433,20 +441,17 @@ fn paint_software_cursor(frame: &mut Frame, origin_x: i32, origin_y: i32, scale_
 #[cfg(not(windows))]
 fn paint_software_cursor(_frame: &mut Frame, _origin_x: i32, _origin_y: i32, _scale_x: f32, _scale_y: f32) {}
 
-/// GPU path keeps the native frame captured through Windows Graphics Capture.
-/// CPU path scales on the CPU so the preference changes the work that is done.
-fn encode(preference: &str, width: u32, height: u32, rgba: &[u8]) -> (u32, u32, &'static str) {
+/// Stats-only path — never touch the pixel buffer on the capture hot loop.
+fn encode(preference: &str, width: u32, height: u32) -> (u32, u32, &'static str) {
     if preference == "cpu" && width > 1280 {
         let target_w = 1280u32;
         let target_h = ((height as u64 * target_w as u64) / width.max(1) as u64).max(2) as u32;
-        let _scaled = scale_rgba(rgba, width, height, target_w, target_h);
         (
             target_w,
             target_h,
             "Windows Graphics Capture · software scale",
         )
     } else {
-        let _ = rgba.first();
         (
             width,
             height,
@@ -475,59 +480,47 @@ fn emit(app: &AppHandle, stats: CaptureStats) {
     let _ = app.emit("suncord://capture", stats);
 }
 
-fn preview_frame(frame: &Frame) -> Frame {
-    let max_w = 960u32;
+fn emit_preview(app: &AppHandle, frame: &Frame) {
+    // Keep preview lean so JPEG never stalls the 60 FPS capture cadence.
+    let max_w = 720u32;
     let (width, height, rgba) = if frame.width > max_w {
         let width = max_w;
         let height = ((frame.height as u64 * width as u64) / frame.width.max(1) as u64).max(2) as u32;
         (
             width,
             height,
-            scale_rgba(&frame.rgba, frame.width, frame.height, width, height),
+            scale_rgba(frame.rgba.as_ref(), frame.width, frame.height, width, height),
         )
     } else {
-        (frame.width, frame.height, frame.rgba.clone())
+        (frame.width, frame.height, frame.rgba.as_ref().clone())
     };
-    let mut out = Frame {
+    let origin_x = frame.origin_x;
+    let origin_y = frame.origin_y;
+    let mut painted = Frame {
         width,
         height,
-        rgba,
-        origin_x: frame.origin_x,
-        origin_y: frame.origin_y,
+        rgba: std::sync::Arc::new(rgba),
+        origin_x,
+        origin_y,
     };
-    paint_software_cursor_scaled(&mut out, frame.width, frame.height);
-    out
-}
-
-fn emit_preview(app: &AppHandle, frame: &Frame) {
-    let rgb = rgba_to_rgb(&frame.rgba);
-    let mut jpeg = Vec::with_capacity((frame.width * frame.height) as usize / 4);
-    let encoder = JpegEncoder::new_with_quality(&mut jpeg, 70);
+    let scale_x = width as f32 / frame.width.max(1) as f32;
+    let scale_y = height as f32 / frame.height.max(1) as f32;
+    paint_software_cursor(&mut painted, origin_x, origin_y, scale_x, scale_y);
+    let rgb = rgba_to_rgb(painted.rgba.as_ref());
+    let mut jpeg = Vec::with_capacity((width * height) as usize / 5);
+    let encoder = JpegEncoder::new_with_quality(&mut jpeg, 55);
     if encoder
-        .write_image(&rgb, frame.width, frame.height, ColorType::Rgb8.into())
+        .write_image(&rgb, width, height, ColorType::Rgb8.into())
         .is_ok()
     {
         let _ = app.emit(
             "suncord://capture-frame",
             CaptureFrame {
-                width: frame.width,
-                height: frame.height,
+                width,
+                height,
                 png_base64: BASE64.encode(jpeg),
             },
         );
-    }
-}
-
-fn paint_software_cursor_scaled(frame: &mut Frame, source_w: u32, source_h: u32) {
-    #[cfg(windows)]
-    {
-        let scale_x = frame.width as f32 / source_w.max(1) as f32;
-        let scale_y = frame.height as f32 / source_h.max(1) as f32;
-        paint_software_cursor(frame, frame.origin_x, frame.origin_y, scale_x, scale_y);
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = (frame, source_w, source_h);
     }
 }
 

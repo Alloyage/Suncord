@@ -203,7 +203,15 @@ async fn run(
                     }
                     VCmd::RetryVoiceServer { ticket } => {
                         let Some(pending_ref) = pending.as_ref() else { continue; };
-                        if pending_ref.wait_ticket != ticket || ready(pending_ref) || rtp.is_some() {
+                        // Never re-fire Opcode 4 once any credential arrived — that rotates the
+                        // voice token and can wipe a valid session_id mid-handshake.
+                        if pending_ref.wait_ticket != ticket
+                            || ready(pending_ref)
+                            || rtp.is_some()
+                            || pending_ref.endpoint.is_some()
+                            || pending_ref.token.is_some()
+                            || pending_ref.session_id.is_some()
+                        {
                             continue;
                         }
                         status.detail = "Still waiting — requesting voice server again…".into();
@@ -360,7 +368,7 @@ fn voice_guild_matches(
     incoming: Option<&String>,
 ) -> bool {
     match (pending_guild, incoming) {
-        (Some(a), Some(b)) => a == b,
+        (Some(a), Some(b)) => a == b || b == pending_channel,
         // Private calls: Opcode 4 uses guild_id null; VOICE_SERVER_UPDATE uses the channel id.
         (None, Some(b)) => b == pending_channel,
         (None, None) => true,
@@ -425,6 +433,7 @@ fn apply_signal(pending: &mut Pending, signal: VoiceSignal, self_id: Option<&str
             session_id,
             ..
         } => {
+            // Leaving / switching away from this channel — ignore for credentials.
             if channel_id.as_deref() != Some(pending.channel_id.as_str()) {
                 return false;
             }
@@ -436,19 +445,22 @@ fn apply_signal(pending: &mut Pending, signal: VoiceSignal, self_id: Option<&str
                 return false;
             }
             // Never adopt another member's session_id — that produces voice close 4006.
-            match self_id {
-                Some(id) if id == user_id.as_str() => {}
-                Some(_) => return false,
-                None => return false,
+            let is_self = match self_id {
+                Some(id) => id == user_id.as_str(),
+                // If we do not know ourselves yet, still accept a session for this channel;
+                // spawn_link will fail closed if user_id is empty.
+                None => true,
+            };
+            if !is_self {
+                return false;
             }
             if !session_id.is_empty() {
                 pending.session_id = Some(session_id);
-                // Bind to the current server ticket when one exists; otherwise wait for VOICE_SERVER.
-                pending.session_ticket = if pending.voice_ticket > 0 {
-                    pending.voice_ticket
-                } else {
-                    0
-                };
+                pending.session_ticket = pending.voice_ticket.max(1);
+                if pending.voice_ticket == 0 {
+                    // State arrived first — provisional ticket until VOICE_SERVER lands.
+                    pending.session_ticket = 1;
+                }
                 log::info!(
                     "voice session bound ticket={} channel={}",
                     pending.session_ticket,
@@ -468,9 +480,10 @@ fn apply_signal(pending: &mut Pending, signal: VoiceSignal, self_id: Option<&str
                 guild_id.as_ref(),
             ) {
                 log::warn!(
-                    "voice server ignored (guild mismatch pending={:?} incoming={:?})",
+                    "voice server ignored (guild mismatch pending={:?} incoming={:?} channel={})",
                     pending.guild_id,
-                    guild_id
+                    guild_id,
+                    pending.channel_id
                 );
                 return false;
             }
@@ -479,19 +492,15 @@ fn apply_signal(pending: &mut Pending, signal: VoiceSignal, self_id: Option<&str
                 pending.endpoint = Some(endpoint);
             }
             if !token.is_empty() {
-                let token_changed = pending
-                    .token
-                    .as_ref()
-                    .is_some_and(|existing| existing != &token);
-                if token_changed {
-                    // New server token invalidates the previous session pairing.
+                let had_token = pending.token.as_ref().is_some_and(|existing| existing != &token);
+                // Only invalidate session when an already-bound token rotates (reconnect).
+                if had_token {
                     pending.session_id = None;
                     pending.session_ticket = 0;
                     rotated = true;
                 }
                 pending.voice_ticket = pending.voice_ticket.wrapping_add(1).max(1);
                 pending.token = Some(token);
-                // State-before-server: keep the session and bind it to this token ticket.
                 if pending.session_id.is_some() {
                     pending.session_ticket = pending.voice_ticket;
                 }
@@ -564,8 +573,11 @@ fn ready(pending: &Pending) -> bool {
         .as_ref()
         .is_some_and(|endpoint| !endpoint.is_empty());
     let token_ok = pending.token.as_ref().is_some_and(|token| !token.is_empty());
-    // Ticket pairing blocks stale session+token mixes after a server rotate.
-    let tickets_ok = pending.voice_ticket > 0 && pending.session_ticket == pending.voice_ticket;
+    // Prefer ticket alignment after a rotate, but never block the first handshake when
+    // both VOICE_STATE and VOICE_SERVER have already arrived for this join.
+    let tickets_ok = pending.voice_ticket == 0
+        || pending.session_ticket == 0
+        || pending.session_ticket == pending.voice_ticket;
     session_ok && endpoint_ok && token_ok && tickets_ok
 }
 
@@ -583,32 +595,39 @@ fn request_voice_server(
     // Opcode 4 must never block the voice select loop.
     let gateway_join = gateway.clone();
     let app_join = app.clone();
-    let mut status_join = status.clone();
     let guild_label = guild_id.clone().unwrap_or_else(|| "dm".into());
     log::info!("voice Opcode 4 guild={guild_label} channel={channel_id}");
+    let channel_for_err = channel_id.clone();
     tauri::async_runtime::spawn(async move {
         match gateway_join
             .voice_state(guild_id, Some(channel_id), mute, deaf)
             .await
         {
             Ok(()) => {
-                status_join.detail = "Waiting for voice server…".into();
-                emit_status(&app_join, &status_join);
+                // Do not clobber a newer status (connecting/live) with a stale clone.
+                log::info!("voice Opcode 4 sent");
             }
             Err(err) => {
-                status_join.phase = "error".into();
-                status_join.detail = err;
-                emit_status(&app_join, &status_join);
+                log::error!("voice Opcode 4 failed: {err}");
+                let fail = VoiceStatus {
+                    phase: "error".into(),
+                    detail: err,
+                    channel_id: Some(channel_for_err),
+                    ..VoiceStatus::default()
+                };
+                emit_status(&app_join, &fail);
             }
         }
     });
     let cmd_later = cmd_tx.clone();
     tauri::async_runtime::spawn(async move {
-        tokio::time::sleep(Duration::from_secs(3)).await;
+        tokio::time::sleep(Duration::from_secs(2)).await;
         let _ = cmd_later.send(VCmd::RetryVoiceServer { ticket });
     });
-    status.detail = "Waiting for voice server…".into();
-    emit_status(app, status);
+    if status.phase == "joining" || status.phase == "idle" {
+        status.detail = "Waiting for voice server…".into();
+        emit_status(app, status);
+    }
 }
 
 async fn spawn_link(

@@ -121,6 +121,7 @@ impl GatewayHandle {
         self_mute: bool,
         self_deaf: bool,
     ) -> Result<(), String> {
+        // Discord desktop always includes self_video; omitting it can stall voice routing.
         let payload = json!({
             "op": 4,
             "d": {
@@ -128,17 +129,18 @@ impl GatewayHandle {
                 "channel_id": channel_id,
                 "self_mute": self_mute,
                 "self_deaf": self_deaf,
+                "self_video": false
             }
         })
         .to_string();
         // Opcode 4 must leave the UI path quickly — brief retry only.
-        for _ in 0..8 {
+        for _ in 0..20 {
             if let Some(tx) = self.gate.outbound.lock().as_ref() {
                 tx.send(Outbound::Text(payload))
                     .map_err(|_| "The gateway socket closed.".to_string())?;
                 return Ok(());
             }
-            tokio::time::sleep(Duration::from_millis(25)).await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
         Err("The gateway is not connected.".into())
     }
@@ -499,16 +501,34 @@ fn dispatch(gate: &Arc<Gate>, value: &serde_json::Value) {
         }
         "VOICE_STATE_UPDATE" => {
             if let Some(signal) = parse_voice_state(&data) {
+                if let VoiceSignal::State {
+                    user_id,
+                    channel_id,
+                    guild_id,
+                    session_id,
+                    ..
+                } = &signal
+                {
+                    log::info!(
+                        "VOICE_STATE_UPDATE user={user_id} channel={channel_id:?} guild={guild_id:?} has_session={}",
+                        !session_id.is_empty()
+                    );
+                }
                 let _ = gate.voice_tx.send(signal);
             } else {
-                log::warn!("VOICE_STATE_UPDATE dropped (unreadable payload)");
+                log::warn!("VOICE_STATE_UPDATE dropped (unreadable payload): {data}");
             }
         }
         "VOICE_SERVER_UPDATE" => {
             if let Some(signal) = parse_voice_server(&data) {
+                log::info!(
+                    "VOICE_SERVER_UPDATE guild={:?} endpoint={}",
+                    data.get("guild_id"),
+                    data.get("endpoint").and_then(|v| v.as_str()).unwrap_or("")
+                );
                 let _ = gate.voice_tx.send(signal);
             } else {
-                log::warn!("VOICE_SERVER_UPDATE dropped (unreadable payload)");
+                log::warn!("VOICE_SERVER_UPDATE dropped (unreadable payload): {data}");
             }
         }
         _ => {}

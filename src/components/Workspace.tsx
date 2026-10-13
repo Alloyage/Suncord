@@ -229,20 +229,24 @@ function FolderBadge({
       }`}
       style={{ background: tint }}
     >
-      {cells.map((guild, index) => (
-        <FolderCell key={guild?.id ?? `empty-${index}`} guild={guild} />
-      ))}
+      {cells.map((guild, index) =>
+        guild ? (
+          <FolderCell key={guild.id} guild={guild} />
+        ) : (
+          <span key={`empty-${index}`} className="h-full w-full" aria-hidden />
+        ),
+      )}
     </button>
   );
 }
 
-function FolderCell({ guild }: { guild: Guild | null }) {
+function FolderCell({ guild }: { guild: Guild }) {
   const [broken, setBroken] = useState(false);
-  const src = guild ? resolveGuildIcon(guild.icon, guild.id) : null;
+  const src = resolveGuildIcon(guild.icon, guild.id);
   useEffect(() => setBroken(false), [src]);
   const showImage = Boolean(src) && !broken;
   return (
-    <span className="flex h-full w-full items-center justify-center overflow-hidden rounded-[4px] bg-[#0c0c0c]">
+    <span className="flex h-full w-full items-center justify-center overflow-hidden rounded-[3px] bg-transparent">
       {showImage ? (
         <img
           src={src!}
@@ -251,7 +255,11 @@ function FolderCell({ guild }: { guild: Guild | null }) {
           draggable={false}
           onError={() => setBroken(true)}
         />
-      ) : null}
+      ) : (
+        <span className="flex h-full w-full items-center justify-center bg-black/25 text-[9px] font-semibold text-cream/90">
+          {(guild.name || "?").slice(0, 1).toUpperCase()}
+        </span>
+      )}
     </span>
   );
 }
@@ -1096,6 +1104,9 @@ function AttachmentList({ attachments }: { attachments: Attachment[] }) {
             </button>
           );
         }
+        if (isTextAttachment(attachment)) {
+          return <TextAttachmentPreview key={attachment.id} attachment={attachment} src={src} />;
+        }
         return (
           <button
             key={attachment.id}
@@ -1106,6 +1117,55 @@ function AttachmentList({ attachments }: { attachments: Attachment[] }) {
           </button>
         );
       })}
+    </div>
+  );
+}
+
+function TextAttachmentPreview({ attachment, src }: { attachment: Attachment; src: string }) {
+  const [text, setText] = useState<string | null>(null);
+  const [error, setError] = useState(false);
+  useEffect(() => {
+    let cancelled = false;
+    setText(null);
+    setError(false);
+    void fetch(src)
+      .then((response) => {
+        if (!response.ok) throw new Error("fetch failed");
+        return response.text();
+      })
+      .then((body) => {
+        if (cancelled) return;
+        // Cap preview so huge logs stay snappy in the chat scroller.
+        setText(body.length > 80_000 ? `${body.slice(0, 80_000)}\n…` : body);
+      })
+      .catch(() => {
+        if (!cancelled) setError(true);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [src]);
+  return (
+    <div className="max-w-lg overflow-hidden rounded-md border border-line bg-[#0e0e0e]">
+      <div className="flex items-center justify-between gap-2 border-b border-white/5 px-3 py-1.5">
+        <span className="truncate text-xs text-mute">{attachment.filename || "text file"}</span>
+        <button
+          type="button"
+          className="shrink-0 text-xs text-cream underline decoration-white/30 underline-offset-2"
+          onClick={() => void openExternal(attachment.url)}
+        >
+          Download
+        </button>
+      </div>
+      {error ? (
+        <p className="px-3 py-2 text-xs text-mute">Could not load preview.</p>
+      ) : text == null ? (
+        <p className="px-3 py-2 text-xs text-mute">Loading preview…</p>
+      ) : (
+        <pre className="max-h-64 overflow-auto whitespace-pre-wrap break-words px-3 py-2 font-mono text-[11px] leading-relaxed text-cream/90">
+          {text}
+        </pre>
+      )}
     </div>
   );
 }
@@ -1169,6 +1229,22 @@ function isVideoAttachment(attachment: Attachment): boolean {
   const type = attachment.contentType?.toLowerCase() ?? "";
   if (type.startsWith("video/")) return true;
   return isVideoUrl(attachment.filename || attachment.url);
+}
+
+function isTextAttachment(attachment: Attachment): boolean {
+  const type = attachment.contentType?.toLowerCase() ?? "";
+  if (
+    type.startsWith("text/") ||
+    type.includes("json") ||
+    type.includes("xml") ||
+    type.includes("javascript") ||
+    type.includes("typescript")
+  ) {
+    return true;
+  }
+  return /\.(txt|log|md|markdown|csv|tsv|json|xml|yml|yaml|toml|ini|cfg|conf|env|rs|ts|tsx|js|jsx|css|html|py|go|java|c|cpp|h|hpp|sh|ps1|bat)$/i.test(
+    attachment.filename || attachment.url,
+  );
 }
 
 function isVideoUrl(value: string): boolean {
