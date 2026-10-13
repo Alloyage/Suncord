@@ -16,7 +16,7 @@
     Ultra-responsive, lightweight desktop client for Discord built with Tauri 2.0, Rust, and React.<br/>
     Designed for zero-latency UI rendering, instant channel navigation, and low overhead.
   </p>
-  <a href="https://github.com/SunSinD/Suncord/releases"><strong>Download Latest Release</strong></a>
+  <a href="https://github.com/SunSinD/Suncord/releases"><strong>Download Latest Release</strong></a> (NOT YET ADDED)
 </div>
 
 <br/>
