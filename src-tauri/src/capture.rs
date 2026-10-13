@@ -342,36 +342,42 @@ fn grab(id: &str) -> Result<Frame, String> {
 }
 
 #[cfg(windows)]
+#[repr(C)]
+struct WinPoint {
+    x: i32,
+    y: i32,
+}
+
+#[cfg(windows)]
+#[repr(C)]
+struct WinCursorInfo {
+    cb_size: u32,
+    flags: u32,
+    cursor: isize,
+    pt_screen_pos: WinPoint,
+}
+
+#[cfg(windows)]
+#[link(name = "user32")]
+extern "system" {
+    fn GetCursorPos(point: *mut WinPoint) -> i32;
+    fn GetCursorInfo(info: *mut WinCursorInfo) -> i32;
+}
+
+#[cfg(windows)]
 fn paint_software_cursor(frame: &mut Frame, origin_x: i32, origin_y: i32, scale_x: f32, scale_y: f32) {
-    #[repr(C)]
-    struct Point {
-        x: i32,
-        y: i32,
-    }
-    #[link(name = "user32")]
-    extern "system" {
-        fn GetCursorPos(point: *mut Point) -> i32;
-        fn GetCursorInfo(info: *mut CursorInfo) -> i32;
-    }
-    #[repr(C)]
-    struct CursorInfo {
-        cb_size: u32,
-        flags: u32,
-        cursor: isize,
-        pt_screen_pos: Point,
-    }
     const CURSOR_SHOWING: u32 = 0x0000_0001;
-    let mut info = CursorInfo {
-        cb_size: std::mem::size_of::<CursorInfo>() as u32,
+    let mut info = WinCursorInfo {
+        cb_size: std::mem::size_of::<WinCursorInfo>() as u32,
         flags: 0,
         cursor: 0,
-        pt_screen_pos: Point { x: 0, y: 0 },
+        pt_screen_pos: WinPoint { x: 0, y: 0 },
     };
     let visible = unsafe { GetCursorInfo(&mut info) } != 0 && (info.flags & CURSOR_SHOWING) != 0;
     if !visible {
         return;
     }
-    let mut point = Point { x: 0, y: 0 };
+    let mut point = WinPoint { x: 0, y: 0 };
     if unsafe { GetCursorPos(&mut point) } == 0 {
         point = info.pt_screen_pos;
     }
