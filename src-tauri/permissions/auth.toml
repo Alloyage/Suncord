@@ -1,0 +1,36 @@
+[[permission]]
+identifier = "allow-auth-capture-token"
+description = "Accept a Discord session token from the login window."
+commands.allow = ["auth_capture_token"]
+
+[[permission]]
+identifier = "allow-auth-start-login"
+description = "Open the Discord sign-in webview from the main window."
+commands.allow = ["auth_start_login"]
+
+[[permission]]
+identifier = "allow-main-window"
+description = "Commands the main window uses after sign-in."
+commands.allow = [
+  "bootstrap",
+  "auth_start_login",
+  "auth_logout",
+  "select_channel",
+  "send_message",
+  "edit_message",
+  "delete_message",
+  "add_reaction",
+  "refresh_dms",
+  "channel_pins",
+  "open_external",
+  "voice_join",
+  "voice_leave",
+  "voice_set_muted",
+  "voice_set_deafened",
+  "voice_devices",
+  "settings_update",
+  "capture_sources",
+  "capture_start",
+  "capture_stop",
+  "capture_set_preview",
+]

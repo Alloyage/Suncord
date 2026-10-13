@@ -1,0 +1,23 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "login",
+  "description": "Discord sign-in page may hand its own session token to the app and nothing else.",
+  "windows": ["login"],
+  "remote": {
+    "urls": [
+      "https://discord.com/*",
+      "https://*.discord.com/*",
+      "https://discordapp.com/*",
+      "https://*.discordapp.com/*",
+      "https://*.hcaptcha.com/*",
+      "https://*.recaptcha.net/*",
+      "https://*.google.com/*",
+      "https://*.gstatic.com/*",
+      "https://*.cloudflare.com/*"
+    ]
+  },
+  "permissions": [
+    "core:event:default",
+    "allow-auth-capture-token"
+  ]
+}

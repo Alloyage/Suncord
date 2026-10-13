@@ -1,0 +1,43 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Suncord",
+  "version": "0.1.0",
+  "identifier": "com.suncord.desktop",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://127.0.0.1:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "withGlobalTauri": false,
+    "windows": [
+      {
+        "label": "main",
+        "title": "Suncord",
+        "width": 1200,
+        "height": 760,
+        "minWidth": 880,
+        "minHeight": 560,
+        "decorations": false,
+        "shadow": true,
+        "transparent": false,
+        "center": true,
+        "resizable": true,
+        "zoomHotkeysEnabled": false,
+        "backgroundColor": "#000000"
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self' ipc: http://ipc.localhost https://ipc.localhost http://tauri.localhost https://tauri.localhost http://127.0.0.1:1420; script-src 'self' 'unsafe-inline' 'unsafe-eval' blob: http://127.0.0.1:1420 http://tauri.localhost https://tauri.localhost; style-src 'self' 'unsafe-inline' http://127.0.0.1:1420; img-src 'self' https://cdn.discordapp.com https://media.discordapp.net https://*.discordapp.com https://*.discord.com data: blob:; media-src 'self' https://cdn.discordapp.com https://media.discordapp.net https://*.discordapp.com blob:; connect-src 'self' ipc: http://ipc.localhost https://ipc.localhost http://tauri.localhost https://tauri.localhost http://127.0.0.1:1420 ws://127.0.0.1:1420 ws://127.0.0.1:1421",
+      "capabilities": ["default", "login"]
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/icon.ico"
+    ]
+  }
+}
