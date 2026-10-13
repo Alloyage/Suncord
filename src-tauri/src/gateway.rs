@@ -21,8 +21,9 @@ use tokio_tungstenite::{
 };
 
 /// Discord user-gateway capability flags (not bot intents).
-/// Mirrors a current desktop client so READY/guild/DM payloads arrive.
-const USER_CAPABILITIES: u64 = 16381;
+/// Bit 9 (USER_SETTINGS_PROTO) is intentionally cleared so READY still includes
+/// JSON `user_settings.guild_folders` instead of opaque protobuf blobs.
+const USER_CAPABILITIES: u64 = 16381 & !(1 << 9);
 const DESKTOP_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36";
 const CLIENT_BUILD: u64 = 280_231;
 
@@ -497,26 +498,17 @@ fn dispatch(gate: &Arc<Gate>, value: &serde_json::Value) {
             }
         }
         "VOICE_STATE_UPDATE" => {
-            if let Ok(state) = serde_json::from_value::<WireVoiceState>(data) {
-                let _ = gate.voice_tx.send(VoiceSignal::State {
-                    guild_id: state.guild_id,
-                    channel_id: state.channel_id,
-                    user_id: state.user_id,
-                    session_id: state.session_id,
-                    self_mute: state.self_mute,
-                    self_deaf: state.self_deaf,
-                    mute: state.mute,
-                    deaf: state.deaf,
-                });
+            if let Some(signal) = parse_voice_state(&data) {
+                let _ = gate.voice_tx.send(signal);
+            } else {
+                log::warn!("VOICE_STATE_UPDATE dropped (unreadable payload)");
             }
         }
         "VOICE_SERVER_UPDATE" => {
-            if let Ok(server) = serde_json::from_value::<WireVoiceServer>(data) {
-                let _ = gate.voice_tx.send(VoiceSignal::Server {
-                    guild_id: server.guild_id,
-                    endpoint: server.endpoint.unwrap_or_default(),
-                    token: server.token.unwrap_or_default(),
-                });
+            if let Some(signal) = parse_voice_server(&data) {
+                let _ = gate.voice_tx.send(signal);
+            } else {
+                log::warn!("VOICE_SERVER_UPDATE dropped (unreadable payload)");
             }
         }
         _ => {}
@@ -622,6 +614,8 @@ fn on_ready(gate: &Arc<Gate>, data: &serde_json::Value) {
     schedule_snapshot(gate);
     // READY guilds are often `{id, unavailable:true}` stubs — hydrate names/icons via REST.
     hydrate_guild_meta(gate);
+    // Folder layout may be missing until settings hydrate (or proto-era READY).
+    hydrate_guild_folders(gate);
     if let Some(channel_id) = gate
         .cache
         .snapshot(false)
@@ -678,6 +672,27 @@ fn hydrate_guild_meta(gate: &Arc<Gate>) {
             }
             Ok(_) => {}
             Err(err) => log::warn!("guild hydrate: {err}"),
+        }
+    });
+}
+
+fn hydrate_guild_folders(gate: &Arc<Gate>) {
+    let rest = gate.rest.clone();
+    let cache = gate.cache.clone();
+    let auth = gate.auth.clone();
+    let app = gate.app.clone();
+    tauri::async_runtime::spawn(async move {
+        let Some(token) = auth.token() else {
+            return;
+        };
+        let Ok(settings) = rest.user_settings(&token).await else {
+            return;
+        };
+        let guilds = cache.snapshot(false).guilds;
+        let folders = parse_guild_folders(Some(&settings), None, settings.get("guild_folders"), &guilds);
+        if folders.iter().any(|folder| !folder.id.starts_with("loose-")) {
+            cache.set_folders(folders);
+            let _ = app.emit("suncord://snapshot", cache.snapshot(false));
         }
     });
 }
@@ -997,34 +1012,52 @@ fn parse_guild_folders(
     folders
 }
 
-#[derive(Deserialize)]
-struct WireVoiceState {
-    #[serde(default, deserialize_with = "deserialize_opt_snowflake")]
-    guild_id: Option<String>,
-    #[serde(default, deserialize_with = "deserialize_opt_snowflake")]
-    channel_id: Option<String>,
-    #[serde(deserialize_with = "deserialize_snowflake")]
-    user_id: String,
-    #[serde(default)]
-    session_id: String,
-    #[serde(default)]
-    self_mute: bool,
-    #[serde(default)]
-    self_deaf: bool,
-    #[serde(default)]
-    mute: bool,
-    #[serde(default)]
-    deaf: bool,
+fn parse_voice_state(data: &serde_json::Value) -> Option<VoiceSignal> {
+    let user_id = data.get("user_id").and_then(snowflake_string)?;
+    let session_id = data
+        .get("session_id")
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .to_string();
+    Some(VoiceSignal::State {
+        guild_id: data.get("guild_id").and_then(snowflake_string),
+        channel_id: data.get("channel_id").and_then(snowflake_string),
+        user_id,
+        session_id,
+        self_mute: json_bool(data.get("self_mute")),
+        self_deaf: json_bool(data.get("self_deaf")),
+        mute: json_bool(data.get("mute")),
+        deaf: json_bool(data.get("deaf")),
+    })
 }
 
-#[derive(Deserialize)]
-struct WireVoiceServer {
-    #[serde(default, deserialize_with = "deserialize_opt_snowflake")]
-    guild_id: Option<String>,
-    #[serde(default)]
-    endpoint: Option<String>,
-    #[serde(default)]
-    token: Option<String>,
+fn parse_voice_server(data: &serde_json::Value) -> Option<VoiceSignal> {
+    let endpoint = data
+        .get("endpoint")
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .to_string();
+    let token = data
+        .get("token")
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .to_string();
+    if endpoint.is_empty() && token.is_empty() {
+        return None;
+    }
+    Some(VoiceSignal::Server {
+        guild_id: data.get("guild_id").and_then(snowflake_string),
+        endpoint,
+        token,
+    })
+}
+
+fn json_bool(value: Option<&serde_json::Value>) -> bool {
+    match value {
+        Some(serde_json::Value::Bool(flag)) => *flag,
+        Some(serde_json::Value::Number(number)) => number.as_u64() == Some(1),
+        _ => false,
+    }
 }
 
 fn deserialize_snowflake<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
@@ -1032,19 +1065,16 @@ fn deserialize_snowflake<'de, D: serde::Deserializer<'de>>(deserializer: D) -> R
     snowflake_string(&value).ok_or_else(|| serde::de::Error::custom("expected snowflake"))
 }
 
-fn deserialize_opt_snowflake<'de, D: serde::Deserializer<'de>>(
-    deserializer: D,
-) -> Result<Option<String>, D::Error> {
-    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
-    Ok(value.as_ref().and_then(snowflake_string))
-}
-
 fn snowflake_string(value: &serde_json::Value) -> Option<String> {
+    if value.is_null() {
+        return None;
+    }
     value
         .as_str()
         .map(str::to_string)
         .or_else(|| value.as_u64().map(|n| n.to_string()))
         .or_else(|| value.as_i64().map(|n| n.to_string()))
+        .filter(|id| !id.is_empty() && id != "null")
 }
 
 fn gateway_url(resume: Option<&str>) -> String {

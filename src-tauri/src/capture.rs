@@ -107,6 +107,7 @@ pub fn list_sources() -> Vec<SourceDto> {
 fn loop_capture(app: AppHandle, commands: std::sync::mpsc::Receiver<CapCmd>) {
     let mut active: Option<String> = None;
     let mut display_stream: Option<NativeDisplayStream> = None;
+    let mut last_frame: Option<Frame> = None;
     let mut fps = 60u32;
     let mut preference = "gpu".to_string();
     let mut preview_enabled = false;
@@ -114,14 +115,14 @@ fn loop_capture(app: AppHandle, commands: std::sync::mpsc::Receiver<CapCmd>) {
     let mut frames = 0u32;
     let mut bytes = 0u64;
     let mut window_started = Instant::now();
-    // Preview PNG encode runs off-thread so the WGC loop can hold 60 FPS.
+    let mut next_emit = Instant::now();
+    // Preview JPEG encode runs off-thread so the capture loop can hold 60 FPS.
     let (preview_tx, preview_rx) = std::sync::mpsc::sync_channel::<Frame>(1);
     let preview_app = app.clone();
     thread::Builder::new()
         .name("suncord-preview".into())
         .spawn(move || {
             while let Ok(frame) = preview_rx.recv() {
-                // Drain to the newest pending preview frame.
                 let mut latest = frame;
                 while let Ok(newer) = preview_rx.try_recv() {
                     latest = newer;
@@ -131,7 +132,8 @@ fn loop_capture(app: AppHandle, commands: std::sync::mpsc::Receiver<CapCmd>) {
         })
         .ok();
     loop {
-        match commands.recv_timeout(Duration::from_millis(if active.is_some() { 1 } else { 200 })) {
+        let idle = active.is_none();
+        match commands.recv_timeout(Duration::from_millis(if idle { 200 } else { 0 })) {
             Ok(CapCmd::Start {
                 id,
                 fps: next_fps,
@@ -141,6 +143,7 @@ fn loop_capture(app: AppHandle, commands: std::sync::mpsc::Receiver<CapCmd>) {
                     stream.stop();
                 }
                 display_stream = NativeDisplayStream::start(&id).ok();
+                last_frame = None;
                 active = Some(id);
                 preview_enabled = false;
                 fps = next_fps.clamp(15, 240);
@@ -149,10 +152,12 @@ fn loop_capture(app: AppHandle, commands: std::sync::mpsc::Receiver<CapCmd>) {
                 frames = 0;
                 bytes = 0;
                 window_started = Instant::now();
+                next_emit = Instant::now();
             }
             Ok(CapCmd::Stop) => {
                 active = None;
                 preview_enabled = false;
+                last_frame = None;
                 if let Some(stream) = display_stream.take() {
                     stream.stop();
                 }
@@ -180,55 +185,62 @@ fn loop_capture(app: AppHandle, commands: std::sync::mpsc::Receiver<CapCmd>) {
         let target_fps = fps.max(1);
         let interval = Duration::from_secs_f64(1.0 / target_fps as f64);
         let tick = Instant::now();
-        // Tiny wait — drain to newest frame so lag never piles up.
-        let wait = Duration::from_millis(2);
-        let frame = if let Some(stream) = display_stream.as_ref() {
-            stream.next_frame(wait)
-        } else {
-            grab(&id)
-        };
-        match frame {
-            Ok(frame) => {
-                let (width, height, path) = encode(&preference, frame.width, frame.height, &frame.rgba);
-                bytes = bytes.saturating_add(frame.rgba.len() as u64);
-                // Move frame into preview slot (no clone). Drop if encode worker is busy.
-                if preview_enabled {
-                    let _ = preview_tx.try_send(frame);
-                }
-                frames += 1;
-                if window_started.elapsed() >= Duration::from_secs(1) {
-                    let elapsed = window_started.elapsed().as_secs_f32().max(0.001);
-                    let measured_fps = frames as f32 / elapsed;
-                    let bitrate_kbps = (bytes as f32 * 8.0 / 1000.0) / elapsed;
-                    frames = 0;
-                    bytes = 0;
-                    window_started = Instant::now();
-                    emit(
-                        &app,
-                        CaptureStats {
-                            running: true,
-                            source: id,
-                            width,
-                            height,
-                            fps: measured_fps,
-                            capture_ms: tick.elapsed().as_secs_f32() * 1000.0,
-                            dropped,
-                            path: path.into(),
-                            bitrate_kbps,
-                        },
-                    );
-                }
+
+        // Drain WGC/desktop-duplication to the newest buffer; never block the pace loop.
+        if let Some(stream) = display_stream.as_ref() {
+            if let Some(frame) = stream.drain_latest() {
+                last_frame = Some(frame);
             }
-            Err(_) => {
-                dropped += 1;
+        } else if last_frame.is_none() || tick >= next_emit {
+            match grab(&id) {
+                Ok(frame) => last_frame = Some(frame),
+                Err(_) => dropped = dropped.saturating_add(1),
             }
         }
-        let elapsed = tick.elapsed();
-        if elapsed < interval {
-            thread::sleep(interval - elapsed);
-        } else {
-            dropped += 1;
-            // Behind target — never sleep; catch up immediately.
+
+        if tick < next_emit {
+            let sleep_for = (next_emit - tick).min(Duration::from_millis(2));
+            if !sleep_for.is_zero() {
+                thread::sleep(sleep_for);
+            }
+            continue;
+        }
+        next_emit = tick + interval;
+
+        let Some(frame) = last_frame.as_ref() else {
+            dropped = dropped.saturating_add(1);
+            continue;
+        };
+        let (width, height, path) = encode(&preference, frame.width, frame.height, &frame.rgba);
+        bytes = bytes.saturating_add(frame.rgba.len() as u64);
+        if preview_enabled {
+            // Scale (+ cursor) before enqueue so we never clone a full 4K buffer at 60 FPS.
+            if preview_tx.try_send(preview_frame(frame)).is_err() {
+                dropped = dropped.saturating_add(1);
+            }
+        }
+        frames += 1;
+        if window_started.elapsed() >= Duration::from_secs(1) {
+            let elapsed = window_started.elapsed().as_secs_f32().max(0.001);
+            let measured_fps = frames as f32 / elapsed;
+            let bitrate_kbps = (bytes as f32 * 8.0 / 1000.0) / elapsed;
+            frames = 0;
+            bytes = 0;
+            window_started = Instant::now();
+            emit(
+                &app,
+                CaptureStats {
+                    running: true,
+                    source: id,
+                    width,
+                    height,
+                    fps: measured_fps,
+                    capture_ms: tick.elapsed().as_secs_f32() * 1000.0,
+                    dropped,
+                    path: path.into(),
+                    bitrate_kbps,
+                },
+            );
         }
     }
 }
@@ -237,6 +249,8 @@ struct Frame {
     width: u32,
     height: u32,
     rgba: Vec<u8>,
+    origin_x: i32,
+    origin_y: i32,
 }
 
 /// Display capture is driven by the D3D desktop-duplication stream instead of
@@ -269,20 +283,18 @@ impl NativeDisplayStream {
         })
     }
 
-    fn next_frame(&self, timeout: Duration) -> Result<Frame, String> {
-        let mut frame = self.frames.recv_timeout(timeout).map_err(|err| err.to_string())?;
-        // Always present the newest desktop frame — backlog causes visible lag.
+    fn drain_latest(&self) -> Option<Frame> {
+        let mut frame = self.frames.try_recv().ok()?;
         while let Ok(newer) = self.frames.try_recv() {
             frame = newer;
         }
-        let mut out = Frame {
+        Some(Frame {
             width: frame.width,
             height: frame.height,
             rgba: frame.raw,
-        };
-        // WGC/xcap omits the hardware cursor — composite it so viewers see the pointer.
-        paint_software_cursor(&mut out, self.origin_x, self.origin_y);
-        Ok(out)
+            origin_x: self.origin_x,
+            origin_y: self.origin_y,
+        })
     }
 
     fn stop(self) {
@@ -300,13 +312,13 @@ fn grab(id: &str) -> Result<Frame, String> {
         let origin_x = monitor.x().unwrap_or(0);
         let origin_y = monitor.y().unwrap_or(0);
         let image = monitor.capture_image().map_err(|err| err.to_string())?;
-        let mut frame = Frame {
+        return Ok(Frame {
             width: image.width(),
             height: image.height(),
             rgba: image.into_raw(),
-        };
-        paint_software_cursor(&mut frame, origin_x, origin_y);
-        return Ok(frame);
+            origin_x,
+            origin_y,
+        });
     }
     if let Some(rest) = id.strip_prefix("window:") {
         let title = rest.split_once(':').map(|(_, title)| title).unwrap_or(rest);
@@ -318,19 +330,19 @@ fn grab(id: &str) -> Result<Frame, String> {
         let origin_x = window.x().unwrap_or(0);
         let origin_y = window.y().unwrap_or(0);
         let image = window.capture_image().map_err(|err| err.to_string())?;
-        let mut frame = Frame {
+        return Ok(Frame {
             width: image.width(),
             height: image.height(),
             rgba: image.into_raw(),
-        };
-        paint_software_cursor(&mut frame, origin_x, origin_y);
-        return Ok(frame);
+            origin_x,
+            origin_y,
+        });
     }
     Err("Unknown capture source.".into())
 }
 
 #[cfg(windows)]
-fn paint_software_cursor(frame: &mut Frame, origin_x: i32, origin_y: i32) {
+fn paint_software_cursor(frame: &mut Frame, origin_x: i32, origin_y: i32, scale_x: f32, scale_y: f32) {
     #[repr(C)]
     struct Point {
         x: i32,
@@ -368,8 +380,8 @@ fn paint_software_cursor(frame: &mut Frame, origin_x: i32, origin_y: i32) {
     if local_x < 0 || local_y < 0 {
         return;
     }
-    let x = local_x as u32;
-    let y = local_y as u32;
+    let x = (local_x as f32 * scale_x).round() as u32;
+    let y = (local_y as f32 * scale_y).round() as u32;
     if x >= frame.width || y >= frame.height {
         return;
     }
@@ -413,7 +425,7 @@ fn paint_software_cursor(frame: &mut Frame, origin_x: i32, origin_y: i32) {
 }
 
 #[cfg(not(windows))]
-fn paint_software_cursor(_frame: &mut Frame, _origin_x: i32, _origin_y: i32) {}
+fn paint_software_cursor(_frame: &mut Frame, _origin_x: i32, _origin_y: i32, _scale_x: f32, _scale_y: f32) {}
 
 /// GPU path keeps the native frame captured through Windows Graphics Capture.
 /// CPU path scales on the CPU so the preference changes the work that is done.
@@ -457,32 +469,59 @@ fn emit(app: &AppHandle, stats: CaptureStats) {
     let _ = app.emit("suncord://capture", stats);
 }
 
-fn emit_preview(app: &AppHandle, frame: &Frame) {
-    // JPEG preview stays small so the WGC loop can hold ~60 FPS.
+fn preview_frame(frame: &Frame) -> Frame {
     let max_w = 960u32;
     let (width, height, rgba) = if frame.width > max_w {
         let width = max_w;
         let height = ((frame.height as u64 * width as u64) / frame.width.max(1) as u64).max(2) as u32;
-        let rgba = scale_rgba(&frame.rgba, frame.width, frame.height, width, height);
-        (width, height, rgba)
+        (
+            width,
+            height,
+            scale_rgba(&frame.rgba, frame.width, frame.height, width, height),
+        )
     } else {
         (frame.width, frame.height, frame.rgba.clone())
     };
-    let rgb = rgba_to_rgb(&rgba);
-    let mut jpeg = Vec::with_capacity((width * height) as usize / 4);
+    let mut out = Frame {
+        width,
+        height,
+        rgba,
+        origin_x: frame.origin_x,
+        origin_y: frame.origin_y,
+    };
+    paint_software_cursor_scaled(&mut out, frame.width, frame.height);
+    out
+}
+
+fn emit_preview(app: &AppHandle, frame: &Frame) {
+    let rgb = rgba_to_rgb(&frame.rgba);
+    let mut jpeg = Vec::with_capacity((frame.width * frame.height) as usize / 4);
     let encoder = JpegEncoder::new_with_quality(&mut jpeg, 70);
     if encoder
-        .write_image(&rgb, width, height, ColorType::Rgb8.into())
+        .write_image(&rgb, frame.width, frame.height, ColorType::Rgb8.into())
         .is_ok()
     {
         let _ = app.emit(
             "suncord://capture-frame",
             CaptureFrame {
-                width,
-                height,
+                width: frame.width,
+                height: frame.height,
                 png_base64: BASE64.encode(jpeg),
             },
         );
+    }
+}
+
+fn paint_software_cursor_scaled(frame: &mut Frame, source_w: u32, source_h: u32) {
+    #[cfg(windows)]
+    {
+        let scale_x = frame.width as f32 / source_w.max(1) as f32;
+        let scale_y = frame.height as f32 / source_h.max(1) as f32;
+        paint_software_cursor(frame, frame.origin_x, frame.origin_y, scale_x, scale_y);
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (frame, source_w, source_h);
     }
 }
 

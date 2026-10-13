@@ -169,59 +169,77 @@ function CallGrid({
   speakingLevel: number;
 }) {
   const capture = useApp((state) => state.capture);
+  const shareRef = useRef<HTMLDivElement>(null);
   const [fullscreen, setFullscreen] = useState(false);
+
   useEffect(() => {
-    if (!fullscreen) return;
-    const onKey = (event: KeyboardEvent) => {
-      if (event.key === "Escape") setFullscreen(false);
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [fullscreen]);
-  const tiles: ReactNode[] = [];
-  if (sharing) {
-    tiles.push(
-      <div
-        key="share"
-        className={`relative col-span-full flex items-center justify-center overflow-hidden rounded-lg bg-black ring-1 ring-white/10 ${
-          fullscreen ? "fixed inset-0 z-50 min-h-0 rounded-none ring-0" : "min-h-[220px]"
-        }`}
-        onDoubleClick={() => setFullscreen((value) => !value)}
-      >
-        <WebGLCapturePreview className="h-full max-h-full w-full object-contain" />
-        <CaptureTelemetryBadge stats={capture} />
-        <button
-          type="button"
-          title={fullscreen ? "Exit full screen" : "Full screen"}
-          aria-label={fullscreen ? "Exit full screen" : "Full screen"}
-          onClick={() => setFullscreen((value) => !value)}
-          className="absolute bottom-3 right-3 rounded bg-black/70 px-2.5 py-1.5 text-[11px] text-cream ring-1 ring-white/15 hover:bg-black/85"
-        >
-          {fullscreen ? "Exit full screen" : "Full screen"}
-        </button>
-      </div>,
-    );
-  }
+    const onChange = () => setFullscreen(Boolean(document.fullscreenElement));
+    document.addEventListener("fullscreenchange", onChange);
+    return () => document.removeEventListener("fullscreenchange", onChange);
+  }, []);
 
-  for (const person of participants) {
+  const toggleFullscreen = (event?: { stopPropagation?: () => void }) => {
+    event?.stopPropagation?.();
+    const node = shareRef.current;
+    if (!node) return;
+    if (document.fullscreenElement) {
+      void document.exitFullscreen().catch(() => setFullscreen(false));
+      return;
+    }
+    const request =
+      node.requestFullscreen?.bind(node) ??
+      (node as HTMLDivElement & { webkitRequestFullscreen?: () => Promise<void> }).webkitRequestFullscreen?.bind(node);
+    if (request) {
+      void Promise.resolve(request()).catch(() => setFullscreen(true));
+      return;
+    }
+    setFullscreen((value) => !value);
+  };
+
+  const people = participants.map((person) => {
     const speaking = person.self ? speakingLevel > 0.04 : false;
-    tiles.push(
-      <ParticipantTile key={person.id} person={person} speaking={speaking} />,
-    );
-  }
+    return <ParticipantTile key={person.id} person={person} speaking={speaking} />;
+  });
 
-  if (!tiles.length) {
-    tiles.push(
-      <div key="empty" className="flex h-full min-h-[180px] items-center justify-center text-sm text-mute">
+  const personCols =
+    people.length <= 1 ? "grid-cols-1" : people.length === 2 ? "grid-cols-2" : "grid-cols-2 lg:grid-cols-3";
+
+  if (!sharing && !people.length) {
+    return (
+      <div className="flex h-full min-h-[180px] items-center justify-center text-sm text-mute">
         Waiting for participants…
-      </div>,
+      </div>
     );
   }
 
-  const cols =
-    tiles.length === 1 ? "grid-cols-1" : tiles.length === 2 ? "grid-cols-1 md:grid-cols-2" : "grid-cols-2 lg:grid-cols-3";
-
-  return <div className={`grid h-full auto-rows-fr gap-3 ${cols}`}>{tiles}</div>;
+  return (
+    <div className="flex h-full min-h-0 flex-col gap-3">
+      {sharing ? (
+        <div
+          ref={shareRef}
+          className={`relative flex min-h-0 flex-[1.4] items-center justify-center overflow-hidden rounded-lg bg-black ring-1 ring-white/10 ${
+            fullscreen && !document.fullscreenElement ? "fixed inset-0 z-[80] rounded-none ring-0" : ""
+          }`}
+          onDoubleClick={() => toggleFullscreen()}
+        >
+          <WebGLCapturePreview className="h-full max-h-full w-full object-contain" />
+          <CaptureTelemetryBadge stats={capture} />
+          <button
+            type="button"
+            title={fullscreen ? "Exit full screen" : "Full screen"}
+            aria-label={fullscreen ? "Exit full screen" : "Full screen"}
+            onClick={(event) => toggleFullscreen(event)}
+            className="absolute bottom-3 right-3 z-10 rounded bg-black/70 px-2.5 py-1.5 text-[11px] text-cream ring-1 ring-white/15 hover:bg-black/85"
+          >
+            {fullscreen ? "Exit full screen" : "Full screen"}
+          </button>
+        </div>
+      ) : null}
+      {people.length ? (
+        <div className={`grid min-h-0 flex-1 auto-rows-fr gap-3 ${personCols}`}>{people}</div>
+      ) : null}
+    </div>
+  );
 }
 
 function CaptureTelemetryBadge({

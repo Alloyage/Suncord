@@ -443,7 +443,17 @@ fn apply_signal(pending: &mut Pending, signal: VoiceSignal, self_id: Option<&str
             }
             if !session_id.is_empty() {
                 pending.session_id = Some(session_id);
-                pending.session_ticket = pending.voice_ticket;
+                // Bind to the current server ticket when one exists; otherwise wait for VOICE_SERVER.
+                pending.session_ticket = if pending.voice_ticket > 0 {
+                    pending.voice_ticket
+                } else {
+                    0
+                };
+                log::info!(
+                    "voice session bound ticket={} channel={}",
+                    pending.session_ticket,
+                    pending.channel_id
+                );
             }
             false
         }
@@ -457,6 +467,11 @@ fn apply_signal(pending: &mut Pending, signal: VoiceSignal, self_id: Option<&str
                 pending.channel_id.as_str(),
                 guild_id.as_ref(),
             ) {
+                log::warn!(
+                    "voice server ignored (guild mismatch pending={:?} incoming={:?})",
+                    pending.guild_id,
+                    guild_id
+                );
                 return false;
             }
             let mut rotated = false;
@@ -480,6 +495,11 @@ fn apply_signal(pending: &mut Pending, signal: VoiceSignal, self_id: Option<&str
                 if pending.session_id.is_some() {
                     pending.session_ticket = pending.voice_ticket;
                 }
+                log::info!(
+                    "voice server bound ticket={} endpoint={}",
+                    pending.voice_ticket,
+                    pending.endpoint.as_deref().unwrap_or("")
+                );
             }
             rotated
         }
@@ -501,13 +521,13 @@ async fn maybe_start_voice_link(
     cmd: mpsc::UnboundedSender<VCmd>,
 ) {
     if !ready(pending) {
-        status.detail = match (
-            pending.session_id.is_some(),
-            pending.endpoint.is_some(),
-            pending.token.is_some(),
-        ) {
+        let session_ok = pending.session_id.as_ref().is_some_and(|id| !id.is_empty());
+        let endpoint_ok = pending.endpoint.as_ref().is_some_and(|endpoint| !endpoint.is_empty());
+        let token_ok = pending.token.as_ref().is_some_and(|token| !token.is_empty());
+        status.detail = match (session_ok, endpoint_ok, token_ok) {
             (false, true, true) => "Got voice server — waiting for session…".into(),
             (true, false, _) | (true, _, false) => "Got session — waiting for voice server…".into(),
+            (true, true, true) => "Pairing voice credentials…".into(),
             _ => status.detail.clone(),
         };
         emit_status(app, status);
@@ -535,12 +555,18 @@ async fn maybe_start_voice_link(
 }
 
 fn ready(pending: &Pending) -> bool {
-    pending.session_id.is_some()
-        && pending.endpoint.is_some()
-        && pending.token.is_some()
-        && pending.voice_ticket > 0
-        && pending.session_ticket == pending.voice_ticket
-        && !pending.session_id.as_ref().is_some_and(|id| id.is_empty())
+    let session_ok = pending
+        .session_id
+        .as_ref()
+        .is_some_and(|id| !id.is_empty());
+    let endpoint_ok = pending
+        .endpoint
+        .as_ref()
+        .is_some_and(|endpoint| !endpoint.is_empty());
+    let token_ok = pending.token.as_ref().is_some_and(|token| !token.is_empty());
+    // Ticket pairing blocks stale session+token mixes after a server rotate.
+    let tickets_ok = pending.voice_ticket > 0 && pending.session_ticket == pending.voice_ticket;
+    session_ok && endpoint_ok && token_ok && tickets_ok
 }
 
 fn request_voice_server(
@@ -558,6 +584,8 @@ fn request_voice_server(
     let gateway_join = gateway.clone();
     let app_join = app.clone();
     let mut status_join = status.clone();
+    let guild_label = guild_id.clone().unwrap_or_else(|| "dm".into());
+    log::info!("voice Opcode 4 guild={guild_label} channel={channel_id}");
     tauri::async_runtime::spawn(async move {
         match gateway_join
             .voice_state(guild_id, Some(channel_id), mute, deaf)
@@ -576,7 +604,7 @@ fn request_voice_server(
     });
     let cmd_later = cmd_tx.clone();
     tauri::async_runtime::spawn(async move {
-        tokio::time::sleep(Duration::from_secs(5)).await;
+        tokio::time::sleep(Duration::from_secs(3)).await;
         let _ = cmd_later.send(VCmd::RetryVoiceServer { ticket });
     });
     status.detail = "Waiting for voice server…".into();

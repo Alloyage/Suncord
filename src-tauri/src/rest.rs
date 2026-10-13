@@ -37,6 +37,11 @@ impl DiscordRest {
         Ok(rows.iter().filter_map(dm_channel_from_value).collect())
     }
 
+    /// Legacy JSON user settings — still the reliable source for `guild_folders`.
+    pub async fn user_settings(&self, token: &Zeroizing<String>) -> Result<serde_json::Value, String> {
+        self.get(token, "/users/@me/settings").await
+    }
+
     /// Partial guild list with name + icon — fills READY unavailable stubs.
     pub async fn user_guilds(&self, token: &Zeroizing<String>) -> Result<Vec<GuildDto>, String> {
         let value = self.get(token, "/users/@me/guilds?with_counts=false").await?;

@@ -171,17 +171,20 @@ function buildRail(folders: GuildFolder[], guilds: Guild[]) {
   const entries: Entry[] = [];
   const seen = new Set<string>();
   for (const folder of folders) {
-    if (!folder.name && folder.guildIds.length === 1) {
-      const guildId = folder.guildIds[0];
-      if (!seen.has(guildId)) {
-        seen.add(guildId);
-        entries.push({ kind: "guild", guildId });
-      }
+    const ids = (folder.guildIds ?? []).filter((id) => id && !seen.has(id));
+    if (!ids.length) continue;
+    // Backend marks unfoldered singles as `loose-{id}`; everything else is a real folder.
+    const loose =
+      folder.id.startsWith("loose-") ||
+      (ids.length === 1 && folder.name == null && folder.color == null && !/^\d+$/.test(folder.id));
+    if (loose) {
+      const guildId = ids[0];
+      seen.add(guildId);
+      entries.push({ kind: "guild", guildId });
       continue;
     }
-    const ids = folder.guildIds.filter((id) => !seen.has(id));
     ids.forEach((id) => seen.add(id));
-    if (ids.length) entries.push({ kind: "folder", folder: { ...folder, guildIds: ids } });
+    entries.push({ kind: "folder", folder: { ...folder, guildIds: ids } });
   }
   for (const guild of guilds) {
     if (!seen.has(guild.id)) entries.push({ kind: "guild", guildId: guild.id });
