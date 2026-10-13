@@ -17,11 +17,14 @@ use tauri::{AppHandle, Emitter};
 use tokio::sync::{mpsc, Notify};
 use tokio_tungstenite::{
     connect_async_with_config,
-    tungstenite::{protocol::WebSocketConfig, Message},
+    tungstenite::{client::IntoClientRequest, protocol::WebSocketConfig, Message},
 };
 
-const INTENT_FULL: u64 = (1 << 0) | (1 << 7) | (1 << 9) | (1 << 12) | (1 << 15);
-const INTENT_NO_CONTENT: u64 = (1 << 0) | (1 << 7) | (1 << 9) | (1 << 12);
+/// Discord user-gateway capability flags (not bot intents).
+/// Mirrors a current desktop client so READY/guild/DM payloads arrive.
+const USER_CAPABILITIES: u64 = 16381;
+const DESKTOP_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36";
+const CLIENT_BUILD: u64 = 280_231;
 
 enum Outbound {
     Text(String),
@@ -37,7 +40,6 @@ struct Session {
     id: Option<String>,
     resume_url: Option<String>,
     seq: Option<u64>,
-    intent_level: u8,
 }
 
 struct Gate {
@@ -79,7 +81,6 @@ impl GatewayHandle {
                 id: None,
                 resume_url: None,
                 seq: None,
-                intent_level: 0,
             }),
             snapshot_pending: AtomicBool::new(false),
         });
@@ -189,10 +190,28 @@ async fn connect_once(gate: Arc<Gate>, generation: u64) -> Result<Stop, String> 
         let session = gate.session.lock();
         gateway_url(session.resume_url.as_deref())
     };
+    let mut request = url
+        .as_str()
+        .into_client_request()
+        .map_err(|err| err.to_string())?;
+    {
+        let headers = request.headers_mut();
+        headers.insert(
+            "User-Agent",
+            DESKTOP_UA.parse().map_err(|err| format!("{err}"))?,
+        );
+        headers.insert(
+            "Origin",
+            "https://discord.com"
+                .parse()
+                .map_err(|err| format!("{err}"))?,
+        );
+    }
     let config = WebSocketConfig::default()
         .max_message_size(Some(64 * 1024 * 1024))
         .max_frame_size(Some(64 * 1024 * 1024));
-    let (socket, _) = connect_async_with_config(&url, Some(config), true)
+    log::info!("gateway connecting {url}");
+    let (socket, _) = connect_async_with_config(request, Some(config), false)
         .await
         .map_err(|err| err.to_string())?;
     let (mut write, mut read) = socket.split();
@@ -222,23 +241,32 @@ async fn connect_once(gate: Arc<Gate>, generation: u64) -> Result<Stop, String> 
         }
         let incoming = tokio::select! {
             _ = missed.notified() => {
+                log::warn!("gateway heartbeat missed");
                 stop = Stop::Reconnect;
                 break;
             }
             message = read.next() => message,
         };
         let Some(message) = incoming else {
+            log::warn!("gateway socket ended");
             break;
         };
         let message = match message {
             Ok(message) => message,
-            Err(_) => break,
+            Err(err) => {
+                log::warn!("gateway read error: {err}");
+                break;
+            }
         };
         let text = match message {
             Message::Text(text) => text.to_string(),
-            Message::Binary(bytes) => match zlib.decode(&bytes) {
-                Ok(decoded) => String::from_utf8(decoded).unwrap_or_default(),
-                Err(_) => continue,
+            Message::Binary(bytes) => match zlib.push(&bytes) {
+                Ok(Some(decoded)) => String::from_utf8(decoded).unwrap_or_default(),
+                Ok(None) => continue, // still waiting on 00 00 FF FF
+                Err(err) => {
+                    log::warn!("gateway zlib error: {err}");
+                    continue;
+                }
             },
             Message::Ping(payload) => {
                 let _ = out_tx.send(Outbound::Pong(payload.to_vec()));
@@ -246,12 +274,19 @@ async fn connect_once(gate: Arc<Gate>, generation: u64) -> Result<Stop, String> 
             }
             Message::Close(frame) => {
                 let code = frame.as_ref().map(|frame| u16::from(frame.code)).unwrap_or(0);
+                let reason = frame
+                    .as_ref()
+                    .map(|frame| frame.reason.to_string())
+                    .unwrap_or_default();
+                log::warn!("gateway closed: code={code} reason={reason}");
                 if code == 4004 {
                     stop = Stop::AuthFailed;
-                } else if code == 4013 || code == 4014 {
+                } else if code == 4001 || code == 4003 || code == 4010 || code == 4011 {
+                    // Bad identify / encoding — clear resume so the next try is a fresh IDENTIFY.
                     let mut session = gate.session.lock();
-                    session.intent_level = session.intent_level.saturating_add(1).min(2);
                     session.id = None;
+                    session.resume_url = None;
+                    session.seq = None;
                 }
                 break;
             }
@@ -262,7 +297,10 @@ async fn connect_once(gate: Arc<Gate>, generation: u64) -> Result<Stop, String> 
         }
         let value: serde_json::Value = match serde_json::from_str(&text) {
             Ok(value) => value,
-            Err(_) => continue,
+            Err(err) => {
+                log::warn!("gateway json error: {err}");
+                continue;
+            }
         };
         let op = value.get("op").and_then(|op| op.as_u64()).unwrap_or(99);
         if let Some(seq) = value.get("s").and_then(|seq| seq.as_u64()) {
@@ -274,6 +312,7 @@ async fn connect_once(gate: Arc<Gate>, generation: u64) -> Result<Stop, String> 
                     .pointer("/d/heartbeat_interval")
                     .and_then(|interval| interval.as_u64())
                     .unwrap_or(41_250);
+                log::info!("gateway HELLO heartbeat={interval}ms");
                 if let Some(task) = heartbeat.take() {
                     task.abort();
                 }
@@ -294,9 +333,13 @@ async fn connect_once(gate: Arc<Gate>, generation: u64) -> Result<Stop, String> 
             11 => {
                 acked.store(true, Ordering::Release);
             }
-            7 => break,
+            7 => {
+                log::info!("gateway requested reconnect (op 7)");
+                break;
+            }
             9 => {
                 let resumable = value.get("d").and_then(|flag| flag.as_bool()).unwrap_or(false);
+                log::warn!("gateway invalid session resumable={resumable}");
                 if !resumable {
                     let mut session = gate.session.lock();
                     session.id = None;
@@ -355,24 +398,47 @@ fn send_identify(outbound: &mpsc::UnboundedSender<Outbound>, gate: &Gate) {
     let Some(token) = gate.auth.token() else {
         return;
     };
-    let level = gate.session.lock().intent_level;
-    let intents = match level {
-        0 => INTENT_FULL,
-        1 => INTENT_NO_CONTENT,
-        _ => 0,
+    // User accounts must IDENTIFY with capabilities + browser properties.
+    // Bot-style `intents` never receive READY for a normal Discord login token.
+    let os = match std::env::consts::OS {
+        "macos" => "Mac OS X",
+        "linux" => "Linux",
+        _ => "Windows",
     };
     let payload = json!({
         "op": 2,
         "d": {
             "token": token.as_str(),
-            "intents": intents,
+            "capabilities": USER_CAPABILITIES,
             "properties": {
-                "os": std::env::consts::OS,
-                "browser": "Suncord",
-                "device": "Suncord"
+                "os": os,
+                "browser": "Chrome",
+                "device": "",
+                "system_locale": "en-US",
+                "browser_user_agent": DESKTOP_UA,
+                "browser_version": "122.0.0.0",
+                "os_version": "10",
+                "referrer": "",
+                "referring_domain": "",
+                "referrer_current": "",
+                "referring_domain_current": "",
+                "release_channel": "stable",
+                "client_build_number": CLIENT_BUILD,
+                "client_event_source": serde_json::Value::Null
+            },
+            "presence": {
+                "status": "online",
+                "since": 0,
+                "activities": [],
+                "afk": false
+            },
+            "compress": false,
+            "client_state": {
+                "guild_versions": {}
             }
         }
     });
+    log::info!("gateway IDENTIFY (user capabilities={USER_CAPABILITIES})");
     let _ = outbound.send(Outbound::Text(payload.to_string()));
 }
 
@@ -400,6 +466,9 @@ fn send_resume(outbound: &mpsc::UnboundedSender<Outbound>, gate: &Gate) {
 fn dispatch(gate: &Arc<Gate>, value: &serde_json::Value) {
     let kind = value.get("t").and_then(|kind| kind.as_str()).unwrap_or("");
     let data = value.get("d").cloned().unwrap_or(serde_json::Value::Null);
+    if kind == "READY" || kind == "RESUMED" {
+        log::info!("gateway dispatch {kind}");
+    }
     match kind {
         "READY" => on_ready(gate, &data),
         "READY_SUPPLEMENTAL" => on_ready_supplemental(gate, &data),
@@ -516,7 +585,6 @@ fn on_ready(gate: &Arc<Gate>, data: &serde_json::Value) {
         let mut session = gate.session.lock();
         session.id = ready.session_id;
         session.resume_url = ready.resume_gateway_url;
-        session.intent_level = 0;
     }
     if let Some(user) = ready.user.as_ref() {
         gate.cache.set_user(user_from_value(user));
@@ -552,6 +620,8 @@ fn on_ready(gate: &Arc<Gate>, data: &serde_json::Value) {
         .replace_structure(guilds, channels, dms, folders);
     emit_status(&gate.app, "ready", "Live");
     schedule_snapshot(gate);
+    // READY guilds are often `{id, unavailable:true}` stubs — hydrate names/icons via REST.
+    hydrate_guild_meta(gate);
     if let Some(channel_id) = gate
         .cache
         .snapshot(false)
@@ -584,11 +654,32 @@ fn on_guild(gate: &Arc<Gate>, data: &serde_json::Value) {
     let Some((guild, channels)) = guild_from_value(data) else {
         return;
     };
-    if guild.name.is_empty() {
+    // Skip pure unavailable stubs; wait for the real GUILD_CREATE / REST hydrate.
+    if guild.name.is_empty() && guild.icon.is_none() && channels.is_empty() {
         return;
     }
     gate.cache.upsert_guild(guild, channels);
     schedule_snapshot(gate);
+}
+
+fn hydrate_guild_meta(gate: &Arc<Gate>) {
+    let rest = gate.rest.clone();
+    let cache = gate.cache.clone();
+    let auth = gate.auth.clone();
+    let app = gate.app.clone();
+    tauri::async_runtime::spawn(async move {
+        let Some(token) = auth.token() else {
+            return;
+        };
+        match rest.user_guilds(&token).await {
+            Ok(guilds) if !guilds.is_empty() => {
+                cache.merge_guild_meta(guilds);
+                let _ = app.emit("suncord://snapshot", cache.snapshot(false));
+            }
+            Ok(_) => {}
+            Err(err) => log::warn!("guild hydrate: {err}"),
+        }
+    });
 }
 
 fn schedule_snapshot(gate: &Arc<Gate>) {
@@ -637,7 +728,7 @@ fn guild_from_value(value: &serde_json::Value) -> Option<(GuildDto, Vec<ChannelD
     Some((
         GuildDto {
             icon: guild_icon_url(&wire.id, &wire.icon),
-            name: wire.name.unwrap_or_else(|| "Server".into()),
+            name: wire.name.unwrap_or_default(),
             id: wire.id,
         },
         channels,
@@ -935,8 +1026,9 @@ struct WireVoiceServer {
 
 fn gateway_url(resume: Option<&str>) -> String {
     let base = resume.unwrap_or("wss://gateway.discord.gg");
+    // User clients still speak gateway v9 with zlib-stream; v10 bot framing hangs IDENTIFY.
     format!(
-        "{}/?v=10&encoding=json&compress=zlib-stream",
+        "{}/?v=9&encoding=json&compress=zlib-stream",
         base.trim_end_matches('/')
     )
 }

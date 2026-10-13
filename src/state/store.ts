@@ -26,6 +26,7 @@ const emptyCapture: CaptureStats = {
   captureMs: 0,
   dropped: 0,
   path: "idle",
+  bitrateKbps: 0,
 };
 
 const emptyAsr: AsrStatus = { enabled: false, detail: "Captions are off.", caption: "", level: 0 };
@@ -45,6 +46,7 @@ type SessionSlice = {
 
 function clearSession(): SessionSlice & {
   phase: Phase;
+  statusDetail: string;
   error: string;
   voice: VoiceStatus;
   capture: CaptureStats;
@@ -56,6 +58,7 @@ function clearSession(): SessionSlice & {
 } {
   return {
     phase: "offline",
+    statusDetail: "",
     error: "",
     user: null,
     guilds: [],
@@ -81,6 +84,7 @@ interface AppStore extends SessionSlice {
   booted: boolean;
   signedIn: boolean;
   phase: Phase;
+  statusDetail: string;
   error: string;
   settings: Settings;
   voice: VoiceStatus;
@@ -145,7 +149,8 @@ export const useApp = create<AppStore>((set) => ({
 
   setSignedIn: (signedIn) => set(signedIn ? { signedIn, error: "" } : { signedIn }),
   resetSession: () => set({ signedIn: false, ...clearSession() }),
-  setStatus: (phase) => set({ phase: normalizePhase(phase) }),
+  setStatus: (phase, statusDetail) =>
+    set({ phase: normalizePhase(phase), statusDetail: statusDetail ?? "" }),
   setError: (error) => set({ error: error ?? "" }),
   clearError: () => set({ error: "" }),
 
@@ -156,9 +161,9 @@ export const useApp = create<AppStore>((set) => ({
       if (signedOut) return { ...clearSession(), signedIn: false };
       return {
         user: next.user ?? state.user,
-        guilds: next.guilds,
-        folders: next.folders ?? [],
-        channels: next.channels,
+        guilds: mergeGuilds(state.guilds, next.guilds),
+        folders: next.folders?.length ? next.folders : state.folders,
+        channels: next.channels.length ? next.channels : state.channels,
         dms: next.dms,
         messages: mergeMessages(state.messages, next.messages),
         users: mergeUsers(state.users, next.users, next.user ?? state.user, next.messages),
@@ -207,7 +212,22 @@ export const useApp = create<AppStore>((set) => ({
     }),
 
   patchSettings: (patch) => set((state) => ({ settings: { ...state.settings, ...patch } })),
-  setVoice: (voice) => set({ voice }),
+  setVoice: (voice) =>
+    set((state) => {
+      const phase = voice.phase ?? state.voice.phase;
+      const normalized =
+        phase === "reconnecting" ? "joining" : phase === "connecting" ? "joining" : phase;
+      return {
+        voice: {
+          ...state.voice,
+          ...voice,
+          phase: normalized,
+          channelId: voice.channelId !== undefined ? voice.channelId : state.voice.channelId,
+          channelName: voice.channelName !== undefined ? voice.channelName : state.voice.channelName,
+          members: voice.members ?? state.voice.members,
+        },
+      };
+    }),
   setCapture: (capture) => set({ capture }),
   setAsr: (asr) => set({ asr }),
   toggleSwitcher: () => set((state) => ({ switcherOpen: !state.switcherOpen })),
@@ -221,10 +241,24 @@ function normalizePhase(phase: unknown): Phase {
   return "offline";
 }
 
+function mergeGuilds(previous: Guild[], incoming: Guild[]): Guild[] {
+  if (!incoming.length) return previous;
+  const byId = new Map(previous.map((guild) => [guild.id, guild]));
+  return incoming.map((guild) => {
+    const old = byId.get(guild.id);
+    if (!old) return guild;
+    return {
+      ...guild,
+      name: guild.name?.trim() ? guild.name : old.name,
+      icon: guild.icon ?? old.icon ?? null,
+    };
+  });
+}
+
 function normalizeSnapshot(snapshot: Snapshot | null | undefined): Snapshot {
   const guilds = (snapshot?.guilds ?? []).filter(Boolean).map((guild) => ({
     id: String(guild.id ?? ""),
-    name: String(guild.name ?? "Server"),
+    name: String(guild.name ?? ""),
     icon: guild.icon ?? null,
   })).filter((guild) => guild.id);
   const channels = (snapshot?.channels ?? []).map(normalizeChannel).filter((channel) => channel.id);

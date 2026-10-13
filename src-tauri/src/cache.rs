@@ -93,10 +93,50 @@ impl CacheStore {
         folders: Vec<GuildFolderDto>,
     ) {
         let mut inner = self.inner.write();
-        inner.guilds = guilds;
-        inner.channels = channels;
+        // READY often ships unavailable stubs. Keep richer name/icon from cache.
+        let previous = std::mem::take(&mut inner.guilds);
+        inner.guilds = guilds
+            .into_iter()
+            .map(|mut guild| {
+                if let Some(old) = previous.iter().find(|item| item.id == guild.id) {
+                    if guild.name.is_empty() && !old.name.is_empty() {
+                        guild.name = old.name.clone();
+                    }
+                    if guild.icon.is_none() && old.icon.is_some() {
+                        guild.icon = old.icon.clone();
+                    }
+                }
+                guild
+            })
+            .collect();
+        // Prefer full channel lists when READY stubs omit them.
+        if channels.is_empty() && !inner.channels.is_empty() {
+            // keep existing guild channels
+        } else if channels.iter().any(|channel| channel.guild_id.is_some()) {
+            inner.channels = channels;
+        } else {
+            inner.channels = channels;
+        }
         inner.dms = sort_dms(dms);
         inner.folders = folders;
+        drop(inner);
+        self.mark();
+    }
+
+    pub fn merge_guild_meta(&self, updates: Vec<GuildDto>) {
+        let mut inner = self.inner.write();
+        for update in updates {
+            if let Some(existing) = inner.guilds.iter_mut().find(|item| item.id == update.id) {
+                if !update.name.is_empty() {
+                    existing.name = update.name;
+                }
+                if update.icon.is_some() {
+                    existing.icon = update.icon;
+                }
+            } else if !update.id.is_empty() {
+                inner.guilds.push(update);
+            }
+        }
         drop(inner);
         self.mark();
     }
@@ -129,14 +169,23 @@ impl CacheStore {
         let mut inner = self.inner.write();
         let id = guild.id.clone();
         if let Some(existing) = inner.guilds.iter_mut().find(|item| item.id == id) {
-            *existing = guild;
+            if !guild.name.is_empty() {
+                existing.name = guild.name;
+            }
+            if guild.icon.is_some() {
+                existing.icon = guild.icon;
+            } else if existing.icon.is_none() {
+                existing.icon = guild.icon;
+            }
         } else {
             inner.guilds.push(guild);
         }
-        inner
-            .channels
-            .retain(|channel| channel.guild_id.as_deref() != Some(id.as_str()));
-        inner.channels.extend(channels);
+        if !channels.is_empty() {
+            inner
+                .channels
+                .retain(|channel| channel.guild_id.as_deref() != Some(id.as_str()));
+            inner.channels.extend(channels);
+        }
         drop(inner);
         self.mark();
     }

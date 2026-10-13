@@ -27,6 +27,15 @@ button {
   cursor: pointer;
 }
 
+button,
+a,
+[role="button"],
+select {
+  transition-property: color, background-color, border-color, opacity, transform, border-radius, box-shadow;
+  transition-duration: 150ms;
+  transition-timing-function: ease-in-out;
+}
+
 .mic-level {
   transition: transform 72ms linear;
   will-change: transform;

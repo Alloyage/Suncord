@@ -1,6 +1,6 @@
 use crate::models::{CaptureFrame, CaptureStats, SourceDto};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
-use image::{codecs::png::PngEncoder, ColorType, ImageEncoder};
+use image::{codecs::jpeg::JpegEncoder, ColorType, ImageEncoder};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter};
@@ -112,7 +112,24 @@ fn loop_capture(app: AppHandle, commands: std::sync::mpsc::Receiver<CapCmd>) {
     let mut preview_enabled = false;
     let mut dropped = 0u64;
     let mut frames = 0u32;
+    let mut bytes = 0u64;
     let mut window_started = Instant::now();
+    // Preview PNG encode runs off-thread so the WGC loop can hold 60 FPS.
+    let (preview_tx, preview_rx) = std::sync::mpsc::sync_channel::<Frame>(1);
+    let preview_app = app.clone();
+    thread::Builder::new()
+        .name("suncord-preview".into())
+        .spawn(move || {
+            while let Ok(frame) = preview_rx.recv() {
+                // Drain to the newest pending preview frame.
+                let mut latest = frame;
+                while let Ok(newer) = preview_rx.try_recv() {
+                    latest = newer;
+                }
+                emit_preview(&preview_app, &latest);
+            }
+        })
+        .ok();
     loop {
         match commands.recv_timeout(Duration::from_millis(if active.is_some() { 1 } else { 200 })) {
             Ok(CapCmd::Start {
@@ -130,6 +147,7 @@ fn loop_capture(app: AppHandle, commands: std::sync::mpsc::Receiver<CapCmd>) {
                 preference = next;
                 dropped = 0;
                 frames = 0;
+                bytes = 0;
                 window_started = Instant::now();
             }
             Ok(CapCmd::Stop) => {
@@ -159,9 +177,11 @@ fn loop_capture(app: AppHandle, commands: std::sync::mpsc::Receiver<CapCmd>) {
         let Some(id) = active.clone() else {
             continue;
         };
-        let interval = Duration::from_secs_f64(1.0 / fps.max(1) as f64);
-        let started = Instant::now();
-        let wait = Duration::from_millis((1000 / fps.max(1)).max(8) as u64);
+        let target_fps = fps.max(1);
+        let interval = Duration::from_secs_f64(1.0 / target_fps as f64);
+        let tick = Instant::now();
+        // Tiny wait — drain to newest frame so lag never piles up.
+        let wait = Duration::from_millis(2);
         let frame = if let Some(stream) = display_stream.as_ref() {
             stream.next_frame(wait)
         } else {
@@ -170,15 +190,18 @@ fn loop_capture(app: AppHandle, commands: std::sync::mpsc::Receiver<CapCmd>) {
         match frame {
             Ok(frame) => {
                 let (width, height, path) = encode(&preference, frame.width, frame.height, &frame.rgba);
-                // A compressed copy is emitted only for the local GPU preview;
-                // capture retains its native RGBA buffer.
+                bytes = bytes.saturating_add(frame.rgba.len() as u64);
+                // Move frame into preview slot (no clone). Drop if encode worker is busy.
                 if preview_enabled {
-                    emit_preview(&app, &frame);
+                    let _ = preview_tx.try_send(frame);
                 }
                 frames += 1;
                 if window_started.elapsed() >= Duration::from_secs(1) {
-                    let fps = frames as f32 / window_started.elapsed().as_secs_f32();
+                    let elapsed = window_started.elapsed().as_secs_f32().max(0.001);
+                    let measured_fps = frames as f32 / elapsed;
+                    let bitrate_kbps = (bytes as f32 * 8.0 / 1000.0) / elapsed;
                     frames = 0;
+                    bytes = 0;
                     window_started = Instant::now();
                     emit(
                         &app,
@@ -187,10 +210,11 @@ fn loop_capture(app: AppHandle, commands: std::sync::mpsc::Receiver<CapCmd>) {
                             source: id,
                             width,
                             height,
-                            fps,
-                            capture_ms: started.elapsed().as_secs_f32() * 1000.0,
+                            fps: measured_fps,
+                            capture_ms: tick.elapsed().as_secs_f32() * 1000.0,
                             dropped,
                             path: path.into(),
+                            bitrate_kbps,
                         },
                     );
                 }
@@ -199,13 +223,12 @@ fn loop_capture(app: AppHandle, commands: std::sync::mpsc::Receiver<CapCmd>) {
                 dropped += 1;
             }
         }
-        let elapsed = started.elapsed();
+        let elapsed = tick.elapsed();
         if elapsed < interval {
             thread::sleep(interval - elapsed);
         } else {
-            // Behind the target. Keep the requested fps and drop the wait.
-            // Quality is not reduced when the machine falls behind.
             dropped += 1;
+            // Behind target — never sleep; catch up immediately.
         }
     }
 }
@@ -238,8 +261,16 @@ impl NativeDisplayStream {
     }
 
     fn next_frame(&self, timeout: Duration) -> Result<Frame, String> {
-        let frame = self.frames.recv_timeout(timeout).map_err(|err| err.to_string())?;
-        Ok(Frame { width: frame.width, height: frame.height, rgba: frame.raw })
+        let mut frame = self.frames.recv_timeout(timeout).map_err(|err| err.to_string())?;
+        // Always present the newest desktop frame — backlog causes visible lag.
+        while let Ok(newer) = self.frames.try_recv() {
+            frame = newer;
+        }
+        Ok(Frame {
+            width: frame.width,
+            height: frame.height,
+            rgba: frame.raw,
+        })
     }
 
     fn stop(self) {
@@ -321,18 +352,21 @@ fn emit(app: &AppHandle, stats: CaptureStats) {
 }
 
 fn emit_preview(app: &AppHandle, frame: &Frame) {
-    // Bound the copied preview so IPC cannot steal time from native capture.
-    let (width, height, rgba) = if frame.width > 960 {
-        let width = 960;
+    // JPEG preview stays small so the WGC loop can hold ~60 FPS.
+    let max_w = 960u32;
+    let (width, height, rgba) = if frame.width > max_w {
+        let width = max_w;
         let height = ((frame.height as u64 * width as u64) / frame.width.max(1) as u64).max(2) as u32;
         let rgba = scale_rgba(&frame.rgba, frame.width, frame.height, width, height);
         (width, height, rgba)
     } else {
         (frame.width, frame.height, frame.rgba.clone())
     };
-    let mut png = Vec::new();
-    if PngEncoder::new(&mut png)
-        .write_image(&rgba, width, height, ColorType::Rgba8.into())
+    let rgb = rgba_to_rgb(&rgba);
+    let mut jpeg = Vec::with_capacity((width * height) as usize / 4);
+    let encoder = JpegEncoder::new_with_quality(&mut jpeg, 70);
+    if encoder
+        .write_image(&rgb, width, height, ColorType::Rgb8.into())
         .is_ok()
     {
         let _ = app.emit(
@@ -340,8 +374,19 @@ fn emit_preview(app: &AppHandle, frame: &Frame) {
             CaptureFrame {
                 width,
                 height,
-                png_base64: BASE64.encode(png),
+                png_base64: BASE64.encode(jpeg),
             },
         );
     }
+}
+
+fn rgba_to_rgb(rgba: &[u8]) -> Vec<u8> {
+    let pixels = rgba.len() / 4;
+    let mut rgb = Vec::with_capacity(pixels * 3);
+    for chunk in rgba.chunks_exact(4) {
+        rgb.push(chunk[0]);
+        rgb.push(chunk[1]);
+        rgb.push(chunk[2]);
+    }
+    rgb
 }

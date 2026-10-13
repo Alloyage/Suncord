@@ -40,15 +40,17 @@ export async function loadBootstrap(): Promise<void> {
 
 let sessionStarted = false;
 
+/** Kept for App mount; real bootstrap runs inside useBackend after listeners bind. */
 export function startSession(): void {
-  if (sessionStarted) return;
   sessionStarted = true;
-  void loadBootstrap();
 }
 
 export function useBackend(): void {
   useEffect(() => {
-    if (!inTauri()) return;
+    if (!inTauri()) {
+      void loadBootstrap();
+      return;
+    }
     let alive = true;
     const stops: Array<() => void> = [];
     void (async () => {
@@ -60,7 +62,7 @@ export function useBackend(): void {
           const signedIn = Boolean(event.payload?.signedIn);
           if (signedIn) {
             useApp.getState().setSignedIn(true);
-            useApp.getState().setStatus("connecting", "Validating session");
+            useApp.getState().setStatus("connecting", "Opening the gateway");
           } else {
             useApp.getState().resetSession();
           }
@@ -96,6 +98,8 @@ export function useBackend(): void {
         return;
       }
       stops.push(...bindings);
+      if (!sessionStarted) sessionStarted = true;
+      await loadBootstrap();
     })();
 
     const syncActiveChannel = () => {

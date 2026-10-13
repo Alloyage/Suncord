@@ -1,4 +1,4 @@
-import { FormEvent, useEffect, useRef, useState, type ReactNode } from "react";
+import { FormEvent, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
   leaveVoice,
   listCaptureSources,
@@ -9,14 +9,20 @@ import {
   stopCapture,
 } from "../lib/backend";
 import { useApp } from "../state/store";
-import { CaptureFrame, CaptureSource } from "../types";
+import { CaptureFrame, CaptureSource, VoiceMember } from "../types";
 
 export function CallOverlay() {
   const voice = useApp((state) => state.voice);
   const capture = useApp((state) => state.capture);
-  const inVoice = Boolean(voice.channelId) && voice.phase !== "idle";
+  const user = useApp((state) => state.user);
+  const inVoice =
+    Boolean(voice.channelId) && voice.phase !== "idle" && voice.phase !== "error";
   const sharing = Boolean(capture?.running);
   const [expanded, setExpanded] = useState(true);
+
+  useEffect(() => {
+    if (inVoice || sharing) setExpanded(true);
+  }, [voice.channelId, sharing]);
 
   useEffect(() => {
     const enabled = sharing && (expanded || inVoice);
@@ -26,39 +32,226 @@ export function CallOverlay() {
     };
   }, [sharing, expanded, inVoice]);
 
+  const participants = useMemo(
+    () => mergeParticipants(voice.members ?? [], user, voice.muted, voice.deafened, voice.level),
+    [voice.members, voice.muted, voice.deafened, voice.level, user],
+  );
+  const count = Math.max(participants.length, inVoice ? 1 : 0);
+
   if (!inVoice && !sharing) return null;
 
-  return (
-    <>
+  const title = inVoice ? voice.channelName || "Voice call" : "Screen share";
+  const detail = inVoice ? voice.detail : "";
+
+  if (!expanded) {
+    return (
       <div className="pointer-events-auto absolute left-0 right-0 top-0 z-20 flex h-11 items-center gap-2 bg-[#0c0c0c] px-3 shadow-[0_1px_0_0_rgba(255,255,255,0.06)]">
         <span className="min-w-0 flex-1 truncate text-sm">
-          {inVoice ? voice.channelName || "Voice call" : "Screen share"}
-          <span className="ml-2 text-xs text-mute">
-            {inVoice ? voice.detail : sharing ? `${capture.width}×${capture.height} · ${capture.fps.toFixed(0)} fps` : ""}
-          </span>
+          {title}
+          {inVoice ? <ParticipantBadge count={count} /> : null}
+          {detail ? <span className="ml-2 text-xs text-mute">{detail}</span> : null}
         </span>
-        {inVoice ? (
-          <>
-            <CallBarButton label={voice.muted ? "Unmute" : "Mute"} active={Boolean(voice.muted)} onClick={() => void setMuted(!voice.muted)} />
-            <CallBarButton label={voice.deafened ? "Undeafen" : "Deafen"} active={Boolean(voice.deafened)} onClick={() => void setDeafened(!voice.deafened)} />
-            <CallBarButton label="Share" active={sharing} onClick={() => useApp.getState().setShareOpen(true)} />
-            <CallBarButton label="Leave" danger onClick={() => void leaveVoice()} />
-          </>
-        ) : null}
-        {sharing ? (
-          <>
-            <CallBarButton label={expanded ? "Collapse" : "Expand"} onClick={() => setExpanded((value) => !value)} />
-            <CallBarButton label="Stop share" danger onClick={() => void stopCapture()} />
-          </>
-        ) : null}
+        <CallControls
+          inVoice={inVoice}
+          sharing={sharing}
+          muted={Boolean(voice.muted)}
+          deafened={Boolean(voice.deafened)}
+          expanded={false}
+          onExpand={() => setExpanded(true)}
+        />
       </div>
-      {sharing && expanded ? (
-        <div className="pointer-events-auto absolute inset-x-0 bottom-0 top-11 z-20 flex items-center justify-center bg-black/90 p-4">
-          <WebGLCapturePreview className="h-full max-h-full w-full max-w-6xl object-contain" />
+    );
+  }
+
+  return (
+    <div className="pointer-events-auto absolute inset-0 z-20 flex flex-col bg-[#0a0a0a]">
+      <header className="flex h-12 shrink-0 items-center gap-3 border-b border-white/5 px-4">
+        <div className="min-w-0 flex-1">
+          <div className="flex items-center gap-2">
+            <h2 className="truncate text-sm font-semibold tracking-wide">{title}</h2>
+            {inVoice ? <ParticipantBadge count={count} /> : null}
+          </div>
+          {detail ? <p className="truncate text-xs text-mute">{detail}</p> : null}
         </div>
+        <span className="shrink-0 text-[10px] uppercase tracking-[0.14em] text-mute">
+          {voice.phase === "live" ? voice.transport || "live" : voice.phase}
+        </span>
+      </header>
+
+      <div className="relative min-h-0 flex-1 p-4">
+        <CallGrid sharing={sharing} participants={participants} speakingLevel={voice.level} />
+      </div>
+
+      <footer className="flex shrink-0 items-center justify-center gap-2 border-t border-white/5 bg-[#0c0c0c] px-4 py-3">
+        <CallControls
+          inVoice={inVoice}
+          sharing={sharing}
+          muted={Boolean(voice.muted)}
+          deafened={Boolean(voice.deafened)}
+          expanded
+          onExpand={() => setExpanded(false)}
+        />
+      </footer>
+    </div>
+  );
+}
+
+function ParticipantBadge({ count }: { count: number }) {
+  return (
+    <span className="inline-flex shrink-0 items-center rounded bg-white/10 px-1.5 py-0.5 text-[11px] tabular-nums text-cream">
+      {count} in call
+    </span>
+  );
+}
+
+function CallControls({
+  inVoice,
+  sharing,
+  muted,
+  deafened,
+  expanded,
+  onExpand,
+}: {
+  inVoice: boolean;
+  sharing: boolean;
+  muted: boolean;
+  deafened: boolean;
+  expanded: boolean;
+  onExpand: () => void;
+}) {
+  return (
+    <>
+      {inVoice ? (
+        <>
+          <CallBarButton label={muted ? "Unmute" : "Mute"} active={muted} onClick={() => void setMuted(!muted)} />
+          <CallBarButton
+            label={deafened ? "Undeafen" : "Deafen"}
+            active={deafened}
+            onClick={() => void setDeafened(!deafened)}
+          />
+          <CallBarButton
+            label={sharing ? "Sharing" : "Share Screen"}
+            active={sharing}
+            onClick={() => useApp.getState().setShareOpen(true)}
+          />
+          <CallBarButton label="Leave" danger onClick={() => void leaveVoice()} />
+        </>
       ) : null}
+      {sharing && !inVoice ? (
+        <CallBarButton label="Stop share" danger onClick={() => void stopCapture()} />
+      ) : null}
+      {sharing && inVoice ? (
+        <CallBarButton label="Stop share" danger onClick={() => void stopCapture()} />
+      ) : null}
+      <CallBarButton label={expanded ? "Collapse" : "Expand"} onClick={onExpand} />
     </>
   );
+}
+
+function CallGrid({
+  sharing,
+  participants,
+  speakingLevel,
+}: {
+  sharing: boolean;
+  participants: GridParticipant[];
+  speakingLevel: number;
+}) {
+  const tiles: ReactNode[] = [];
+  if (sharing) {
+    tiles.push(
+      <div
+        key="share"
+        className="relative col-span-full flex min-h-[220px] items-center justify-center overflow-hidden rounded-lg bg-black ring-1 ring-white/10"
+      >
+        <WebGLCapturePreview className="h-full max-h-full w-full object-contain" />
+      </div>,
+    );
+  }
+
+  for (const person of participants) {
+    const speaking = person.self ? speakingLevel > 0.04 : false;
+    tiles.push(
+      <ParticipantTile key={person.id} person={person} speaking={speaking} />,
+    );
+  }
+
+  if (!tiles.length) {
+    tiles.push(
+      <div key="empty" className="flex h-full min-h-[180px] items-center justify-center text-sm text-mute">
+        Waiting for participants…
+      </div>,
+    );
+  }
+
+  const cols =
+    tiles.length === 1 ? "grid-cols-1" : tiles.length === 2 ? "grid-cols-1 md:grid-cols-2" : "grid-cols-2 lg:grid-cols-3";
+
+  return <div className={`grid h-full auto-rows-fr gap-3 ${cols}`}>{tiles}</div>;
+}
+
+type GridParticipant = VoiceMember & { self?: boolean };
+
+function ParticipantTile({ person, speaking }: { person: GridParticipant; speaking: boolean }) {
+  const [broken, setBroken] = useState(false);
+  const initial = (person.name || "?").slice(0, 1).toUpperCase();
+  const showImage = Boolean(person.avatar) && !broken;
+  return (
+    <div
+      className={`relative flex min-h-[140px] flex-col items-center justify-center gap-3 overflow-hidden rounded-lg bg-[#141414] transition-[box-shadow] ${
+        speaking ? "shadow-[0_0_0_2px_rgba(87,242,135,0.85)]" : "ring-1 ring-white/8"
+      }`}
+    >
+      <div className="flex h-20 w-20 items-center justify-center overflow-hidden rounded-full bg-[#1c1c1c] text-2xl font-medium text-cream">
+        {showImage ? (
+          <img
+            src={person.avatar!}
+            alt=""
+            className="h-full w-full object-cover"
+            onError={() => setBroken(true)}
+          />
+        ) : (
+          initial
+        )}
+      </div>
+      <div className="px-3 text-center">
+        <p className="truncate text-sm font-medium">
+          {person.name}
+          {person.self ? <span className="text-mute"> (you)</span> : null}
+        </p>
+        <p className="text-[11px] text-mute">
+          {person.deafened ? "Deafened" : person.muted ? "Muted" : speaking ? "Speaking" : "In call"}
+        </p>
+      </div>
+    </div>
+  );
+}
+
+function mergeParticipants(
+  members: VoiceMember[],
+  user: { id: string; name: string; avatar?: string | null } | null,
+  muted: boolean,
+  deafened: boolean,
+  _level: number,
+): GridParticipant[] {
+  const byId = new Map<string, GridParticipant>();
+  for (const member of members) {
+    byId.set(member.id, { ...member, self: user?.id === member.id });
+  }
+  if (user?.id && !byId.has(user.id)) {
+    byId.set(user.id, {
+      id: user.id,
+      name: user.name,
+      avatar: user.avatar,
+      muted,
+      deafened,
+      self: true,
+    });
+  } else if (user?.id) {
+    const self = byId.get(user.id)!;
+    byId.set(user.id, { ...self, muted, deafened, self: true });
+  }
+  return Array.from(byId.values()).sort((a, b) => Number(Boolean(b.self)) - Number(Boolean(a.self)) || a.name.localeCompare(b.name));
 }
 
 function CallBarButton({
@@ -75,8 +268,10 @@ function CallBarButton({
   return (
     <button
       type="button"
+      title={label}
+      aria-label={label}
       onClick={onClick}
-      className={`shrink-0 rounded px-2.5 py-1 text-xs ${
+      className={`shrink-0 rounded px-2.5 py-1.5 text-xs transition-all duration-150 ease-in-out ${
         danger
           ? "bg-[#3a1515] text-[#ffb4b4] hover:bg-[#4a1c1c]"
           : active
@@ -105,17 +300,15 @@ export function ShareSheet() {
   return (
     <Sheet title="Share screen" onClose={() => useApp.getState().setShareOpen(false)}>
       {capture?.running ? (
-        <p className="text-sm text-mute">
-          Streaming {capture.width}x{capture.height} at {capture.fps.toFixed(0)} fps — preview is in the call overlay.
-        </p>
+        <p className="text-sm text-mute">Screen share is live in the call view.</p>
       ) : (
-        <p className="text-sm text-mute">Pick a display or window to capture at 60 FPS.</p>
+        <p className="text-sm text-mute">Pick a display or window to share.</p>
       )}
-      <div className="mt-3 max-h-72 overflow-auto">
+      <div className="mt-3 max-h-[min(50vh,320px)] overflow-auto">
         {(sources ?? []).map((source) => (
           <button
             key={source.id}
-            className="flex w-full items-center justify-between rounded px-2 py-2 text-left text-sm hover:bg-white/5"
+            className="flex w-full items-center justify-between rounded px-2 py-2 text-left text-sm transition-all duration-150 ease-in-out hover:bg-white/5"
             onClick={() => {
               void startCapture(source.id);
               useApp.getState().setShareOpen(false);
@@ -159,6 +352,7 @@ function WebGLCapturePreview({ className }: { className?: string }) {
     let animation = 0;
     void import("@tauri-apps/api/event").then(({ listen }) =>
       listen<CaptureFrame>("suncord://capture-frame", (event) => {
+        // Always keep the newest frame; drop backlog while decoding.
         latest.current = event.payload;
       }).then((stop) => {
         if (cancelled) stop();
@@ -179,6 +373,10 @@ function WebGLCapturePreview({ className }: { className?: string }) {
             if (node.width !== next.width || node.height !== next.height) {
               node.width = next.width;
               node.height = next.height;
+            }
+            // If a newer frame arrived while decoding, paint it on the next tick.
+            if (latest.current) {
+              requestAnimationFrame(draw);
             }
           })
           .catch(() => {
@@ -217,7 +415,9 @@ function WebGLCapturePreview({ className }: { className?: string }) {
 
 function decodePng(data: string): Promise<ImageBitmap> {
   const bytes = Uint8Array.from(atob(data), (char) => char.charCodeAt(0));
-  return createImageBitmap(new Blob([bytes], { type: "image/png" }));
+  // Capture now ships JPEG; keep image/png fallback for older payloads.
+  const jpeg = bytes.length > 2 && bytes[0] === 0xff && bytes[1] === 0xd8;
+  return createImageBitmap(new Blob([bytes], { type: jpeg ? "image/jpeg" : "image/png" }));
 }
 
 function makePreviewProgram(gl: WebGLRenderingContext | WebGL2RenderingContext): WebGLProgram | null {
@@ -245,19 +445,27 @@ function makePreviewProgram(gl: WebGLRenderingContext | WebGL2RenderingContext):
 
 function Sheet({ title, onClose, children }: { title: string; onClose: () => void; children: ReactNode }) {
   return (
-    <div className="absolute inset-0 z-40 flex justify-end bg-black/40" onMouseDown={onClose}>
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4 transition-all duration-150 ease-in-out"
+      onMouseDown={onClose}
+    >
       <form
-        className="h-full w-[360px] overflow-auto border-l border-line bg-side p-4"
+        className="flex max-h-[min(80vh,640px)] w-full max-w-md flex-col overflow-hidden rounded-lg border border-line bg-side p-4 shadow-xl transition-all duration-150 ease-in-out"
         onMouseDown={(event) => event.stopPropagation()}
         onSubmit={(event: FormEvent) => event.preventDefault()}
       >
-        <div className="mb-4 flex items-center justify-between">
+        <div className="mb-4 flex shrink-0 items-center justify-between">
           <h2 className="text-sm font-semibold">{title}</h2>
-          <button type="button" onClick={onClose} className="text-mute">
+          <button
+            type="button"
+            title="Close"
+            onClick={onClose}
+            className="rounded px-2 py-1 text-mute transition-all duration-150 ease-in-out hover:bg-white/10 hover:text-cream"
+          >
             Close
           </button>
         </div>
-        {children}
+        <div className="min-h-0 flex-1 overflow-auto">{children}</div>
       </form>
     </div>
   );

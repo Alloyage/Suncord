@@ -12,11 +12,9 @@ export function App() {
   const booted = useApp((state) => state.booted);
   const signedIn = useApp((state) => state.signedIn);
   const phase = useApp((state) => state.phase);
+  const statusDetail = useApp((state) => state.statusDetail);
   const user = useApp((state) => state.user);
   const error = useApp((state) => state.error);
-  const voice = useApp((state) => state.voice);
-  const capture = useApp((state) => state.capture);
-  const callActive = (Boolean(voice?.channelId) && voice?.phase !== "idle") || Boolean(capture?.running);
 
   useEffect(() => {
     startSession();
@@ -54,7 +52,7 @@ export function App() {
     body = (
       <StatusPane
         title={phase === "reconnecting" ? "Reconnecting" : "Connecting"}
-        detail={error || "Validating your token and opening the gateway."}
+        detail={error || statusDetail || "Validating your token and opening the gateway."}
         busy={!error}
         action={
           error ? (
@@ -98,7 +96,7 @@ export function App() {
   return (
     <div className="flex h-full flex-col bg-black text-cream" onContextMenu={(event) => event.preventDefault()}>
       <TitleBar />
-      <div className={`relative z-0 min-h-0 flex-1 bg-ink ${callActive ? "pt-11" : ""}`}>
+      <div className="relative z-0 min-h-0 flex-1 bg-ink">
         {body}
         <CallOverlay />
       </div>
@@ -260,11 +258,11 @@ function QuickSwitcher() {
   if (!open) return null;
   return (
     <div
-      className="absolute inset-0 z-40 flex items-start justify-center bg-black/50 pt-24"
+      className="fixed inset-0 z-50 flex items-start justify-center bg-black/50 p-4 pt-24 transition-all duration-150 ease-in-out"
       onMouseDown={() => useApp.getState().setSwitcher(false)}
     >
       <div
-        className="w-[520px] overflow-hidden rounded-lg border border-line bg-panel shadow-none"
+        className="w-full max-w-[520px] overflow-hidden rounded-lg border border-line bg-panel shadow-xl transition-all duration-150 ease-in-out"
         onMouseDown={(event) => event.stopPropagation()}
       >
         <input
@@ -297,7 +295,7 @@ function QuickSwitcher() {
             items.map((item, index) => (
               <button
                 key={`${item.guildId ?? "dm"}-${item.id}`}
-                className={`flex w-full items-center justify-between px-4 py-2 text-left text-sm ${index === cursor ? "bg-white/5" : ""}`}
+                className={`flex w-full items-center justify-between px-4 py-2 text-left text-sm transition-all duration-150 ease-in-out ${index === cursor ? "bg-white/5" : "hover:bg-white/5"}`}
                 onMouseEnter={() => setCursor(index)}
                 onClick={() => {
                   useApp.getState().setPlace(item.guildId, item.id);
@@ -426,19 +424,27 @@ function Check({ label, checked, onChange }: { label: string; checked: boolean; 
 
 function Sheet({ title, onClose, children }: { title: string; onClose: () => void; children: ReactNode }) {
   return (
-    <div className="absolute inset-0 z-40 flex justify-end bg-black/40" onMouseDown={onClose}>
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4 transition-all duration-150 ease-in-out"
+      onMouseDown={onClose}
+    >
       <form
-        className="h-full w-[360px] overflow-auto border-l border-line bg-side p-4"
+        className="flex max-h-[min(80vh,640px)] w-full max-w-md flex-col overflow-hidden rounded-lg border border-line bg-side p-4 shadow-xl transition-all duration-150 ease-in-out"
         onMouseDown={(event) => event.stopPropagation()}
         onSubmit={(event: FormEvent) => event.preventDefault()}
       >
-        <div className="mb-4 flex items-center justify-between">
+        <div className="mb-4 flex shrink-0 items-center justify-between">
           <h2 className="text-sm font-semibold">{title}</h2>
-          <button type="button" onClick={onClose} className="text-mute">
+          <button
+            type="button"
+            title="Close"
+            onClick={onClose}
+            className="rounded px-2 py-1 text-mute transition-all duration-150 ease-in-out hover:bg-white/10 hover:text-cream"
+          >
             Close
           </button>
         </div>
-        {children}
+        <div className="min-h-0 flex-1 space-y-0 overflow-auto">{children}</div>
       </form>
     </div>
   );

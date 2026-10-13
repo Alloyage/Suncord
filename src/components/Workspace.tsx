@@ -65,7 +65,7 @@ function ServerRail({
   }, []);
 
   return (
-    <nav className="flex w-[72px] shrink-0 flex-col items-center gap-2 overflow-auto bg-rail py-3">
+    <nav className="flex w-[72px] shrink-0 flex-col items-center gap-2 overflow-y-auto overflow-x-visible bg-rail py-3">
       <button
         title="Direct Messages"
         aria-label="Direct Messages"
@@ -89,10 +89,10 @@ function ServerRail({
             })
             .catch(() => undefined);
         }}
-        className={`flex h-12 w-12 items-center justify-center ${
+        className={`flex h-12 w-12 shrink-0 items-center justify-center transition-all duration-150 ease-in-out ${
           activeGuildId == null
-            ? "rounded-xl bg-white text-black"
-            : "rounded-2xl bg-[#141414] text-cream hover:rounded-xl hover:bg-[#1c1c1c]"
+            ? "rounded-2xl bg-white text-black"
+            : "rounded-[24px] bg-[#141414] text-cream hover:rounded-2xl hover:bg-[#1c1c1c]"
         }`}
       >
         <SunIcon />
@@ -105,8 +105,9 @@ function ServerRail({
           return (
             <RailButton
               key={guild.id}
-              label={guild.name || "Server"}
+              label={(guild.name ?? "").trim() || "Server"}
               image={guild.icon}
+              guildId={guild.id}
               active={activeGuildId === guild.id}
               onClick={() => openGuild(guild.id)}
             />
@@ -131,8 +132,9 @@ function ServerRail({
                   return (
                     <RailButton
                       key={`${entry.folder.id}-${guild.id}`}
-                      label={guild.name || "Server"}
+                      label={(guild.name ?? "").trim() || "Server"}
                       image={guild.icon}
+                      guildId={guild.id}
                       active={activeGuildId === guild.id}
                       onClick={() => openGuild(guild.id)}
                     />
@@ -185,28 +187,61 @@ function RailButton({
   label,
   active,
   image,
+  guildId,
   onClick,
 }: {
   label: string;
   active: boolean;
   image?: string | null;
+  guildId?: string;
   onClick: () => void;
 }) {
-  const initial = (label || "?").slice(0, 1).toUpperCase();
+  const [broken, setBroken] = useState(false);
+  const src = resolveGuildIcon(image, guildId);
+  useEffect(() => setBroken(false), [src]);
+  const showImage = Boolean(src) && !broken;
   return (
     <button
       title={label}
       onClick={onClick}
-      className={`flex h-12 w-12 items-center justify-center overflow-hidden text-sm font-medium ${active ? "rounded-xl bg-white text-black" : "rounded-2xl bg-[#141414] text-cream hover:rounded-xl hover:bg-[#1c1c1c]"}`}
+      className={`flex h-12 w-12 shrink-0 items-center justify-center overflow-hidden transition-all duration-150 ease-in-out ${
+        active
+          ? "rounded-2xl bg-[#1a1a1a] ring-2 ring-white/80"
+          : "rounded-[24px] bg-[#141414] hover:rounded-2xl hover:bg-[#1c1c1c]"
+      }`}
     >
-      {image ? <img src={image} alt="" className="h-full w-full object-cover" /> : initial}
+      {showImage ? (
+        <img
+          src={src!}
+          alt=""
+          width={48}
+          height={48}
+          className="h-12 w-12 object-cover"
+          draggable={false}
+          onError={() => setBroken(true)}
+        />
+      ) : null}
     </button>
   );
 }
 
+function resolveGuildIcon(icon?: string | null, guildId?: string): string | null {
+  if (!icon) return null;
+  let value = icon.trim();
+  if (!value || value === "null" || value === "undefined") return null;
+  if (/^https?:\/\//i.test(value)) {
+    return value.replace(/\.webp(\?|$)/i, ".png$1");
+  }
+  value = value.replace(/\.(png|jpe?g|gif|webp)$/i, "").split("?")[0] ?? value;
+  if (!/^(a_)?[0-9a-f]{8,}$/i.test(value)) return null;
+  if (!guildId) return null;
+  const ext = value.startsWith("a_") ? "gif" : "png";
+  return `https://cdn.discordapp.com/icons/${guildId}/${value}.${ext}?size=128`;
+}
+
 function SunIcon() {
   return (
-    <svg width="22" height="22" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+    <svg className="shrink-0" width="22" height="22" viewBox="0 0 24 24" fill="none" aria-hidden="true">
       <circle cx="12" cy="12" r="4.25" fill="currentColor" />
       <g stroke="currentColor" strokeWidth="1.85" strokeLinecap="round">
         <path d="M12 2.25v2.2" />
@@ -245,7 +280,8 @@ function Sidebar({
   const title = activeGuildId
     ? guilds.find((guild) => guild.id === activeGuildId)?.name ?? "Server"
     : "Direct messages";
-  const inVoice = Boolean(voice.channelId) && voice.phase !== "idle";
+  const inVoice =
+    Boolean(voice.channelId) && voice.phase !== "idle" && voice.phase !== "error";
   const members = voice.members ?? [];
   const micLevel = useLiveMicLevel(settings?.inputDevice ?? "", inVoice && !voice.muted);
 
@@ -285,7 +321,7 @@ function Sidebar({
           <DmList channels={visible} activeId={activeChannelId} />
         )}
       </div>
-      <div className="shrink-0 border-t border-line px-2 pb-2.5 pt-2">
+      <div className="shrink-0 border-t border-line px-3 pb-3 pt-2.5">
         {inVoice ? (
           <div className="mb-2 rounded bg-black/40 px-2 py-2">
             <p className="text-[11px] uppercase tracking-wide text-mute">Voice connected</p>
@@ -309,7 +345,7 @@ function Sidebar({
         <label className="mb-2 block px-0.5 text-[11px] text-mute">
           Microphone
           <select
-            className="mt-1 w-full truncate rounded bg-[#141414] px-2 py-1.5 text-xs text-cream outline-none"
+            className="mt-1 w-full truncate rounded bg-[#141414] px-2 py-1.5 text-xs text-cream outline-none transition-all duration-150 ease-in-out"
             value={settings?.inputDevice ?? ""}
             onChange={(event) => {
               const inputDevice = event.target.value;
@@ -325,24 +361,41 @@ function Sidebar({
             ))}
           </select>
         </label>
-        <div className="mb-2 h-1.5 overflow-hidden rounded bg-black">
-          <div
-            className="mic-level h-full origin-left bg-white/80"
-            style={{ transform: `scaleX(${Math.min(1, Math.max(0.02, micLevel * 1.6))})` }}
+        {inVoice ? (
+          <div className="mb-2 h-1.5 overflow-hidden rounded bg-black" title="Microphone level" aria-hidden={!inVoice}>
+            <div
+              className="mic-level h-full origin-left bg-white/80"
+              style={{ transform: `scaleX(${Math.min(1, Math.max(0.02, micLevel * 1.6))})` }}
+            />
+          </div>
+        ) : null}
+        <div className="mb-2 flex items-center gap-1">
+          <VoiceToggle
+            label={voice.muted ? "Unmute microphone" : "Mute microphone"}
+            active={Boolean(voice.muted)}
+            onClick={() => void setMuted(!voice.muted)}
+            icon="mute"
           />
-        </div>
-        <div className="mb-2 flex flex-wrap items-center gap-1 px-0.5">
-          <VoiceToggle label={voice.muted ? "Unmute" : "Mute"} active={Boolean(voice.muted)} onClick={() => void setMuted(!voice.muted)} icon="mute" />
-          <VoiceToggle label={voice.deafened ? "Undeafen" : "Deafen"} active={Boolean(voice.deafened)} onClick={() => void setDeafened(!voice.deafened)} icon="deafen" />
+          <VoiceToggle
+            label={voice.deafened ? "Undeafen" : "Deafen headphones"}
+            active={Boolean(voice.deafened)}
+            onClick={() => void setDeafened(!voice.deafened)}
+            icon="deafen"
+          />
           {inVoice ? (
             <>
-              <VoiceToggle label="Disconnect" active={false} onClick={() => void leaveVoice()} icon="disconnect" />
-              <VoiceToggle label="Share screen" active={false} onClick={() => useApp.getState().setShareOpen(true)} icon="share" />
+              <VoiceToggle label="Disconnect from voice" active={false} onClick={() => void leaveVoice()} icon="disconnect" />
+              <VoiceToggle
+                label="Share screen"
+                active={false}
+                onClick={() => useApp.getState().setShareOpen(true)}
+                icon="share"
+              />
             </>
           ) : null}
         </div>
         {asr.caption ? <p className="mb-2 px-1 text-xs text-mute">{asr.caption}</p> : null}
-        <div className="flex min-w-0 items-center gap-2 rounded px-0.5 py-1">
+        <div className="flex min-w-0 items-center gap-2 overflow-visible py-0.5">
           <div className="flex h-8 w-8 shrink-0 items-center justify-center overflow-hidden rounded-full bg-[#1a1a1a] text-xs">
             {user?.avatar ? (
               <img src={user.avatar} alt="" className="h-full w-full object-cover" />
@@ -353,7 +406,9 @@ function Sidebar({
           <div className="min-w-0 flex-1 truncate text-sm">{user?.name ?? "Account"}</div>
           <button
             type="button"
-            className={`shrink-0 rounded px-2 py-1.5 text-xs ${asr.enabled ? "bg-white text-black" : "text-mute hover:bg-white/10 hover:text-cream"}`}
+            title={asr.enabled ? "Turn off local captions" : "Turn on local captions"}
+            aria-label={asr.enabled ? "Turn off local captions" : "Turn on local captions"}
+            className={`flex h-8 shrink-0 items-center justify-center rounded px-2 text-xs transition-all duration-150 ease-in-out ${asr.enabled ? "bg-white text-black" : "text-mute hover:bg-white/10 hover:text-cream"}`}
             onClick={() => {
               const next = !useApp.getState().settings.asrEnabled;
               useApp.getState().patchSettings({ asrEnabled: next });
@@ -364,9 +419,10 @@ function Sidebar({
           </button>
           <button
             type="button"
-            className="shrink-0 rounded px-2 py-1.5 text-xs text-mute hover:bg-white/10 hover:text-cream"
+            title="User settings"
+            className="flex h-8 w-8 shrink-0 items-center justify-center rounded text-xs text-mute transition-all duration-150 ease-in-out hover:bg-white/10 hover:text-cream"
             onClick={() => useApp.getState().setSettingsOpen(true)}
-            aria-label="Settings"
+            aria-label="User settings"
           >
             ···
           </button>
@@ -453,7 +509,7 @@ function VoiceToggle({ label, active, onClick, icon }: { label: string; active: 
       aria-label={label}
       aria-pressed={active}
       onClick={onClick}
-      className={`flex h-8 w-8 shrink-0 items-center justify-center rounded transition-colors ${active ? "bg-white text-black" : "text-mute hover:bg-white/10 hover:text-cream"}`}
+      className={`flex h-8 w-8 shrink-0 items-center justify-center rounded transition-all duration-150 ease-in-out ${active ? "bg-white text-black" : "text-mute hover:bg-white/10 hover:text-cream"}`}
     >
       <VoiceGlyph icon={icon} />
     </button>
@@ -461,7 +517,7 @@ function VoiceToggle({ label, active, onClick, icon }: { label: string; active: 
 }
 
 function VoiceGlyph({ icon }: { icon: "mute" | "deafen" | "disconnect" | "share" }) {
-  const common = { width: 16, height: 16, viewBox: "0 0 24 24", fill: "none", stroke: "currentColor", strokeWidth: 2, strokeLinecap: "round" as const, strokeLinejoin: "round" as const, "aria-hidden": true };
+  const common = { width: 15, height: 15, viewBox: "0 0 24 24", fill: "none", stroke: "currentColor", strokeWidth: 2, strokeLinecap: "round" as const, strokeLinejoin: "round" as const, "aria-hidden": true, className: "shrink-0 overflow-visible" };
   if (icon === "mute") return <svg {...common}><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 5.2 2.1" /><path d="M5 10v2a7 7 0 0 0 11.3 5.5" /><path d="M12 19v3" /><path d="M3 3l18 18" /></svg>;
   if (icon === "deafen") return <svg {...common}><path d="M4 13a8 8 0 0 1 16 0" /><path d="M4 13v4h4v-5" /><path d="M20 13v4h-4v-5" /><path d="M3 3l18 18" /></svg>;
   if (icon === "disconnect") {
@@ -523,7 +579,7 @@ function ChannelRow({ channel, active, guildId }: { channel: Channel; active: bo
   const label = channel.name || (dm ? "Direct message" : "channel");
   return (
     <button
-      className={`flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-sm ${active ? "bg-white/10 text-cream" : "text-mute hover:bg-white/5 hover:text-cream"}`}
+      className={`flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-sm transition-all duration-150 ease-in-out ${active ? "bg-white/10 text-cream" : "text-mute hover:bg-white/5 hover:text-cream"}`}
       onClick={() => {
         if (voice) {
           void joinVoice(channel.id, guildId);

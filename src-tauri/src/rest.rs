@@ -1,6 +1,6 @@
 use crate::models::{
-    avatar_url, channel_icon_url, display_name, AttachmentDto, ChannelDto, ChatMessageDto, EmbedDto,
-    MediaDto, UserDto,
+    avatar_url, channel_icon_url, display_name, guild_icon_url, AttachmentDto, ChannelDto,
+    ChatMessageDto, EmbedDto, GuildDto, MediaDto, UserDto,
 };
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, USER_AGENT};
 use serde::Deserialize;
@@ -35,6 +35,32 @@ impl DiscordRest {
         let value = self.get(token, "/users/@me/channels").await?;
         let rows = value.as_array().cloned().unwrap_or_default();
         Ok(rows.iter().filter_map(dm_channel_from_value).collect())
+    }
+
+    /// Partial guild list with name + icon — fills READY unavailable stubs.
+    pub async fn user_guilds(&self, token: &Zeroizing<String>) -> Result<Vec<GuildDto>, String> {
+        let value = self.get(token, "/users/@me/guilds?with_counts=false").await?;
+        let rows = value.as_array().cloned().unwrap_or_default();
+        Ok(rows
+            .iter()
+            .filter_map(|row| {
+                let id = row.get("id")?.as_str()?.to_string();
+                let name = row
+                    .get("name")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let icon_hash = row
+                    .get("icon")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string);
+                Some(GuildDto {
+                    icon: guild_icon_url(&id, &icon_hash),
+                    id,
+                    name,
+                })
+            })
+            .collect())
     }
 
     pub async fn messages(

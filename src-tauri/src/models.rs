@@ -307,6 +307,8 @@ pub struct CaptureStats {
     pub capture_ms: f32,
     pub dropped: u64,
     pub path: String,
+    #[serde(default)]
+    pub bitrate_kbps: f32,
 }
 
 /// Compressed preview frame for the WebGL monitor. Capture itself stays native RGBA.
@@ -329,6 +331,7 @@ impl Default for CaptureStats {
             capture_ms: 0.0,
             dropped: 0,
             path: "idle".into(),
+            bitrate_kbps: 0.0,
         }
     }
 }
@@ -384,17 +387,49 @@ pub fn encoder_name() -> String {
 }
 
 pub fn avatar_url(user_id: &str, avatar: &Option<String>) -> Option<String> {
-    let hash = avatar.as_ref()?;
-    let ext = if hash.starts_with("a_") { "gif" } else { "webp" };
+    let hash = avatar.as_ref()?.trim();
+    if hash.is_empty() {
+        return None;
+    }
+    if hash.starts_with("http://") || hash.starts_with("https://") {
+        return Some(hash.to_string());
+    }
+    let ext = if hash.starts_with("a_") { "gif" } else { "png" };
     Some(format!(
-        "https://cdn.discordapp.com/avatars/{user_id}/{hash}.{ext}?size=64"
+        "https://cdn.discordapp.com/avatars/{user_id}/{hash}.{ext}?size=128"
     ))
 }
 
 pub fn guild_icon_url(guild_id: &str, icon: &Option<String>) -> Option<String> {
-    let hash = icon.as_ref()?;
+    let mut hash = icon.as_ref()?.trim().to_string();
+    if hash.is_empty() || hash == "null" || hash == "undefined" {
+        return None;
+    }
+    // Already a CDN URL (re-hydrated snapshot) — prefer png over webp.
+    if hash.starts_with("http://") || hash.starts_with("https://") {
+        if let Some(idx) = hash.find(".webp") {
+            hash.replace_range(idx..idx + 5, ".png");
+        }
+        return Some(hash);
+    }
+    let cleaned = hash
+        .split('?')
+        .next()
+        .unwrap_or(&hash)
+        .trim_end_matches(".png")
+        .trim_end_matches(".gif")
+        .trim_end_matches(".webp")
+        .trim_end_matches(".jpg")
+        .trim_end_matches(".jpeg")
+        .to_string();
+    // Discord icon hashes are hex (animated prefixes start with a_).
+    let body = cleaned.strip_prefix("a_").unwrap_or(cleaned.as_str());
+    if body.len() < 8 || !body.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    let ext = if cleaned.starts_with("a_") { "gif" } else { "png" };
     Some(format!(
-        "https://cdn.discordapp.com/icons/{guild_id}/{hash}.webp?size=64"
+        "https://cdn.discordapp.com/icons/{guild_id}/{cleaned}.{ext}?size=128"
     ))
 }
 

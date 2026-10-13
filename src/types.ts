@@ -138,6 +138,7 @@ export interface CaptureStats {
   captureMs: number;
   dropped: number;
   path: string;
+  bitrateKbps?: number;
 }
 
 export interface CaptureFrame {
