@@ -37,7 +37,7 @@ nix run
 Or pin the flake input and run:
 
 ```bash
-nix run github:SunSinD/Suncord#suncord
+nix run github:Alloyage/Suncord#suncord
 ```
 
 Ensure your system provides WebKitGTK 4.1 and PipeWire as linked by `flake.nix`.

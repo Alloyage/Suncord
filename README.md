@@ -16,7 +16,7 @@
     Ultra-responsive, lightweight desktop client for Discord built with Tauri 2.0, Rust, and React.<br/>
     Designed for zero-latency UI rendering, instant channel navigation, and low overhead.
   </p>
-  <a href="https://github.com/SunSinD/Suncord/releases"><strong>Download Latest Release</strong></a> (NOT YET ADDED)
+  <a href="https://github.com/Alloyage/Suncord/releases"><strong>Download Latest Release</strong></a> (NOT YET ADDED)
 </div>
 
 <br/>
@@ -57,7 +57,7 @@ Suncord offloads state caching, gateway protocol handling, and media processing 
 
 ### Option 1: Direct Download (Windows) (NOT YET IMPLEMENTED)
 
-Download the pre-compiled installer from the [Releases](https://github.com/SunSinD/Suncord/releases) page:
+Download the pre-compiled installer from the [Releases](https://github.com/Alloyage/Suncord/releases) page:
 
 - **Windows Installer (`.exe` / `.msi`)**: Run the setup wizard to install Suncord directly.
 
@@ -68,4 +68,4 @@ Download the pre-compiled installer from the [Releases](https://github.com/SunSi
 Run Suncord directly using the repository flake:
 
 ```bash
-nix run github:SunSinD/Suncord
+nix run github:Alloyage/Suncord
