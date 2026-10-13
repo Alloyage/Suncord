@@ -21,6 +21,7 @@
           openssl
           pipewire
           alsa-lib
+          libopus
           libgbm
           glib
           cairo
