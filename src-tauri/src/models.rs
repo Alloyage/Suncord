@@ -314,13 +314,21 @@ pub struct CaptureStats {
     pub bitrate_kbps: f32,
 }
 
-/// Compressed preview frame for the WebGL monitor. Capture itself stays native RGBA.
+/// Preview frame for the WebGL monitor (`format`: `rgb` raw or `jpeg`).
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CaptureFrame {
     pub width: u32,
     pub height: u32,
+    /// `rgb` = interleaved 8-bit RGB; `jpeg` = legacy compressed fallback.
+    #[serde(default = "default_frame_format")]
+    pub format: String,
     pub png_base64: String,
+}
+
+#[allow(dead_code)]
+fn default_frame_format() -> String {
+    "rgb".into()
 }
 
 impl Default for CaptureStats {

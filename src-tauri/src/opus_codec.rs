@@ -2,6 +2,8 @@ use std::os::raw::{c_int, c_void};
 
 const APPLICATION_VOIP: c_int = 2048;
 pub const FRAME_SAMPLES: usize = 960;
+/// Discord comfort noise / silence Opus frame (20 ms).
+pub const SILENCE_OPUS: &[u8] = &[0xf8, 0xff, 0xfe];
 
 pub struct Encoder {
     raw: *mut c_void,
@@ -51,6 +53,55 @@ impl Drop for Encoder {
     }
 }
 
+pub struct Decoder {
+    raw: *mut c_void,
+}
+
+unsafe impl Send for Decoder {}
+
+impl Decoder {
+    pub fn new() -> Result<Self, String> {
+        let mut error = 0;
+        let raw = unsafe { opus_decoder_create(48_000, 2, &mut error) };
+        if raw.is_null() || error != 0 {
+            return Err(format!("opus decoder did not start ({error})"));
+        }
+        Ok(Self { raw })
+    }
+
+    pub fn decode(&mut self, packet: &[u8]) -> Result<Vec<f32>, String> {
+        let mut pcm = vec![0f32; FRAME_SAMPLES * 2];
+        let written = unsafe {
+            opus_decode_float(
+                self.raw,
+                if packet.is_empty() {
+                    std::ptr::null()
+                } else {
+                    packet.as_ptr()
+                },
+                packet.len() as c_int,
+                pcm.as_mut_ptr(),
+                FRAME_SAMPLES as c_int,
+                0,
+            )
+        };
+        if written < 0 {
+            return Err(format!("opus decode failed ({written})"));
+        }
+        pcm.truncate((written as usize) * 2);
+        Ok(pcm)
+    }
+}
+
+impl Drop for Decoder {
+    fn drop(&mut self) {
+        if !self.raw.is_null() {
+            unsafe { opus_decoder_destroy(self.raw) }
+            self.raw = std::ptr::null_mut();
+        }
+    }
+}
+
 #[link(name = "opus", kind = "static")]
 extern "C" {
     fn opus_encoder_create(
@@ -67,6 +118,16 @@ extern "C" {
         max_data_bytes: c_int,
     ) -> c_int;
     fn opus_encoder_destroy(encoder: *mut c_void);
+    fn opus_decoder_create(sample_rate: c_int, channels: c_int, error: *mut c_int) -> *mut c_void;
+    fn opus_decode_float(
+        decoder: *mut c_void,
+        data: *const u8,
+        len: c_int,
+        pcm: *mut f32,
+        frame_size: c_int,
+        decode_fec: c_int,
+    ) -> c_int;
+    fn opus_decoder_destroy(decoder: *mut c_void);
 }
 
 #[cfg(test)]

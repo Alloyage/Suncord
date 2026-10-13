@@ -61,10 +61,9 @@ impl DaveSession {
         self.version = version;
         if version == 0 {
             self.phase = Phase::Transport;
-        } else if self.phase == Phase::Transport {
-            // Session Description selected DAVE — wait for MLS opcodes before sealing.
-            self.phase = Phase::ExternalSender;
         }
+        // Keep media on transport encryption until Opcode 22 marks the session Active.
+        // Premature seal_media with a placeholder MLS key produces silent/corrupt RTP.
     }
 
     pub fn label(&self) -> &'static str {
@@ -78,11 +77,28 @@ impl DaveSession {
 
     /// Opus in, bytes to hand to transport encryption.
     pub fn seal_media(&mut self, opus: &[u8]) -> Vec<u8> {
-        if self.version == 0 || self.phase == Phase::Transport {
+        // Only wrap after the DAVE transition is Active — otherwise send raw Opus.
+        if self.phase != Phase::Active {
             return opus.to_vec();
         }
         self.nonce = self.nonce.wrapping_add(1);
         wrap_frame(opus, &self.sender_key(), self.nonce).unwrap_or_else(|_| opus.to_vec())
+    }
+
+    /// Strip a DAVE supplemental trailer when present; pass through plain Opus otherwise.
+    pub fn open_media<'a>(&self, payload: &'a [u8]) -> &'a [u8] {
+        if payload.len() < 3 || payload[payload.len() - 2..] != [0xfa, 0xfa] {
+            return payload;
+        }
+        // Peer DAVE frames need MLS keys — skip until the session is Active.
+        if self.phase != Phase::Active {
+            return &[];
+        }
+        let supplemental = payload[payload.len() - 3] as usize;
+        if supplemental == 0 || supplemental >= payload.len() {
+            return &[];
+        }
+        &payload[..payload.len() - supplemental]
     }
 
     pub fn on_json(&mut self, value: &Value) -> Vec<String> {

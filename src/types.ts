@@ -145,6 +145,8 @@ export interface CaptureStats {
 export interface CaptureFrame {
   width: number;
   height: number;
+  /** `rgb` raw interleaved bytes, or `jpeg` compressed. */
+  format?: string;
   pngBase64: string;
 }
 

@@ -173,11 +173,21 @@ export const useApp = create<AppStore>((set) => ({
     }),
 
   setPlace: (activeGuildId, activeChannelId) =>
-    set((state) => ({
-      activeGuildId,
-      activeChannelId,
-      lastDmId: activeGuildId == null && activeChannelId ? activeChannelId : state.lastDmId,
-    })),
+    set((state) => {
+      const switched = activeChannelId != state.activeChannelId;
+      // Instantly clear the destination channel's visible rows so the previous
+      // chat cannot linger for a frame while REST history loads.
+      let messages = state.messages;
+      if (switched && activeChannelId) {
+        messages = { ...state.messages, [activeChannelId]: [] };
+      }
+      return {
+        activeGuildId,
+        activeChannelId,
+        lastDmId: activeGuildId == null && activeChannelId ? activeChannelId : state.lastDmId,
+        messages,
+      };
+    }),
 
   replaceMessages: (channelId, messages) =>
     set((state) => {

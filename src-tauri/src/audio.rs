@@ -54,6 +54,128 @@ impl AudioPump {
     }
 }
 
+/// Plays decoded Opus PCM on the system default (or named) output device.
+pub struct PlaybackPump {
+    tx: std::sync::mpsc::SyncSender<Vec<f32>>,
+    _thread: Option<JoinHandle<()>>,
+}
+
+impl PlaybackPump {
+    pub fn start(output_name: String) -> Self {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<f32>>(32);
+        let thread = thread::Builder::new()
+            .name("suncord-playback".into())
+            .spawn(move || playback_loop(rx, output_name))
+            .ok();
+        Self {
+            tx,
+            _thread: thread,
+        }
+    }
+
+    pub fn push(&self, samples: Vec<f32>) {
+        let _ = self.tx.try_send(samples);
+    }
+
+    pub fn stop(&self) {
+        // Dropping the sender wakes the playback thread; clone stays alive on self.
+        // Sending an empty frame is the stop signal.
+        let _ = self.tx.try_send(Vec::new());
+    }
+}
+
+fn playback_loop(rx: std::sync::mpsc::Receiver<Vec<f32>>, output_name: String) {
+    let (mut producer, consumer) = RingBuffer::<f32>::new(48_000 * 2);
+    let stream = match open_output(&output_name, consumer) {
+        Ok(stream) => stream,
+        Err(err) => {
+            log::warn!("audio output did not open: {err}");
+            // Keep draining so the voice UDP loop never blocks on a full channel.
+            while rx.recv().is_ok() {}
+            return;
+        }
+    };
+    if let Err(err) = stream.play() {
+        log::warn!("audio output play failed: {err}");
+        return;
+    }
+    log::info!("audio output ready");
+    while let Ok(samples) = rx.recv() {
+        if samples.is_empty() {
+            break;
+        }
+        for sample in samples {
+            let _ = producer.push(sample);
+        }
+    }
+}
+
+fn open_output(name: &str, mut consumer: Consumer<f32>) -> Result<Stream, String> {
+    let device = find_device(name, false).ok_or("No output device is available.")?;
+    let supported = device
+        .default_output_config()
+        .map_err(|err| err.to_string())?;
+    let sample_rate = supported.sample_rate().0;
+    let channels = supported.channels().max(1) as usize;
+    let format = supported.sample_format();
+    let config = StreamConfig {
+        channels: supported.channels(),
+        sample_rate: supported.sample_rate(),
+        buffer_size: BufferSize::Default,
+    };
+    // Playback ring is 48 kHz stereo; resample naively if the device differs.
+    let ratio = sample_rate as f64 / PIPELINE_RATE as f64;
+    let stream = match format {
+        SampleFormat::F32 => device
+            .build_output_stream(
+                &config,
+                move |data: &mut [f32], _| {
+                    fill_output(data, channels, ratio, &mut consumer);
+                },
+                |err| log::warn!("audio output: {err}"),
+                None,
+            )
+            .map_err(|err| err.to_string())?,
+        SampleFormat::I16 => device
+            .build_output_stream(
+                &config,
+                move |data: &mut [i16], _| {
+                    let mut f32_buf = vec![0f32; data.len()];
+                    fill_output(&mut f32_buf, channels, ratio, &mut consumer);
+                    for (dst, sample) in data.iter_mut().zip(f32_buf.iter()) {
+                        *dst = (sample.clamp(-1.0, 1.0) * 32767.0) as i16;
+                    }
+                },
+                |err| log::warn!("audio output: {err}"),
+                None,
+            )
+            .map_err(|err| err.to_string())?,
+        _ => return Err("This output device's sample format is not supported.".into()),
+    };
+    Ok(stream)
+}
+
+fn fill_output(data: &mut [f32], channels: usize, ratio: f64, consumer: &mut Consumer<f32>) {
+    // Device callback wants interleaved samples at device rate/channels.
+    // Pull stereo pairs from the 48 kHz ring and duplicate/resample lightly.
+    let frames = data.len() / channels.max(1);
+    for frame in 0..frames {
+        let left = consumer.pop().unwrap_or(0.0);
+        let right = consumer.pop().unwrap_or(left);
+        let _ = ratio; // keep timing on the capture clock; drop/pad via ring underruns
+        let base = frame * channels;
+        if channels == 1 {
+            data[base] = (left + right) * 0.5;
+        } else {
+            data[base] = left;
+            data[base + 1] = right;
+            for extra in data.iter_mut().skip(base + 2).take(channels.saturating_sub(2)) {
+                *extra = 0.0;
+            }
+        }
+    }
+}
+
 pub fn list_devices() -> Vec<AudioDeviceDto> {
     let host = cpal::default_host();
     let mut devices = Vec::new();

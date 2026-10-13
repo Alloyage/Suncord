@@ -441,7 +441,8 @@ function WebGLCapturePreview({
 }) {
   const canvas = useRef<HTMLCanvasElement>(null);
   const latest = useRef<CaptureFrame | null>(null);
-  const bitmap = useRef<ImageBitmap | null>(null);
+  const rgbPixels = useRef<Uint8Array | null>(null);
+  const rgbSize = useRef({ w: 0, h: 0 });
   const dirty = useRef(false);
   const texSize = useRef({ w: 0, h: 0 });
 
@@ -472,6 +473,7 @@ function WebGLCapturePreview({
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
     let unlisten: (() => void) | undefined;
     let cancelled = false;
     let decoding = false;
@@ -479,7 +481,7 @@ function WebGLCapturePreview({
     let animation = 0;
     let drawn = 0;
     let fpsWindow = performance.now();
-    const worker = createJpegDecodeWorker();
+    const worker = createFrameDecodeWorker();
     const pumpDecode = () => {
       if (cancelled || decoding) return;
       const frame = latest.current;
@@ -487,41 +489,45 @@ function WebGLCapturePreview({
       latest.current = null;
       decoding = true;
       const id = (decodeId += 1);
-      const apply = (next: ImageBitmap) => {
+      const format = frame.format === "jpeg" ? "jpeg" : "rgb";
+      const applyRgb = (pixels: Uint8Array, width: number, height: number) => {
         decoding = false;
-        if (cancelled || id !== decodeId) {
-          next.close();
-          return;
-        }
-        bitmap.current?.close();
-        bitmap.current = next;
+        if (cancelled || id !== decodeId) return;
+        rgbPixels.current = pixels;
+        rgbSize.current = { w: width, h: height };
         dirty.current = true;
-        if (node.width !== next.width || node.height !== next.height) {
-          node.width = next.width;
-          node.height = next.height;
+        if (node.width !== width || node.height !== height) {
+          node.width = width;
+          node.height = height;
         }
         if (latest.current) pumpDecode();
       };
       if (worker) {
-        const onMessage = (event: MessageEvent<{ id: number; bitmap?: ImageBitmap; error?: string }>) => {
+        const onMessage = (
+          event: MessageEvent<{ id: number; rgb?: Uint8Array; width?: number; height?: number; error?: string }>,
+        ) => {
           if (event.data.id !== id) return;
           worker.removeEventListener("message", onMessage);
-          if (event.data.bitmap) apply(event.data.bitmap);
-          else {
+          if (event.data.rgb && event.data.width && event.data.height) {
+            applyRgb(event.data.rgb, event.data.width, event.data.height);
+          } else {
             decoding = false;
             if (latest.current) pumpDecode();
           }
         };
         worker.addEventListener("message", onMessage);
-        worker.postMessage({ id, data: frame.pngBase64 });
+        worker.postMessage({ id, data: frame.pngBase64, format, width: frame.width, height: frame.height });
         return;
       }
-      decodeJpegBase64(frame.pngBase64)
-        .then(apply)
-        .catch(() => {
-          decoding = false;
-          if (latest.current) pumpDecode();
-        });
+      try {
+        const binary = atob(frame.pngBase64);
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
+        applyRgb(bytes, frame.width, frame.height);
+      } catch {
+        decoding = false;
+        if (latest.current) pumpDecode();
+      }
     };
     void import("@tauri-apps/api/event").then(({ listen }) =>
       listen<CaptureFrame>("suncord://capture-frame", (event) => {
@@ -533,8 +539,9 @@ function WebGLCapturePreview({
       }),
     );
     const draw = () => {
-      const image = bitmap.current;
-      if (image && dirty.current) {
+      const pixels = rgbPixels.current;
+      const size = rgbSize.current;
+      if (pixels && dirty.current && size.w > 0 && size.h > 0) {
         dirty.current = false;
         gl.viewport(0, 0, node.width, node.height);
         gl.useProgram(program);
@@ -542,12 +549,12 @@ function WebGLCapturePreview({
         gl.enableVertexAttribArray(position);
         gl.vertexAttribPointer(position, 2, gl.FLOAT, false, 0, 0);
         gl.bindTexture(gl.TEXTURE_2D, texture);
-        // texSubImage2D avoids realloc stutter when the preview size is stable.
-        if (texSize.current.w === image.width && texSize.current.h === image.height) {
-          gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, gl.RGBA, gl.UNSIGNED_BYTE, image);
+        // Direct RGB upload — no JPEG decode / ImageBitmap realloc stutter.
+        if (texSize.current.w === size.w && texSize.current.h === size.h) {
+          gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, size.w, size.h, gl.RGB, gl.UNSIGNED_BYTE, pixels);
         } else {
-          gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, image);
-          texSize.current = { w: image.width, h: image.height };
+          gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB, size.w, size.h, 0, gl.RGB, gl.UNSIGNED_BYTE, pixels);
+          texSize.current = { w: size.w, h: size.h };
         }
         gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
         drawn += 1;
@@ -566,8 +573,7 @@ function WebGLCapturePreview({
       cancelAnimationFrame(animation);
       unlisten?.();
       worker?.terminate();
-      bitmap.current?.close();
-      bitmap.current = null;
+      rgbPixels.current = null;
       gl.deleteTexture(texture);
       gl.deleteBuffer(buffer);
       gl.deleteProgram(program);
@@ -576,21 +582,37 @@ function WebGLCapturePreview({
   return <canvas ref={canvas} className={className ?? "h-full w-full object-contain"} aria-label="Screen share preview" />;
 }
 
-function createJpegDecodeWorker(): Worker | null {
+function createFrameDecodeWorker(): Worker | null {
   if (typeof Worker === "undefined") return null;
   try {
     const source = `
       self.onmessage = async (event) => {
-        const { id, data } = event.data;
+        const { id, data, format, width, height } = event.data;
         try {
           const binary = atob(data);
           const bytes = new Uint8Array(binary.length);
           for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-          const bitmap = await createImageBitmap(new Blob([bytes], { type: "image/jpeg" }), {
-            premultiplyAlpha: "none",
-            colorSpaceConversion: "none",
-          });
-          self.postMessage({ id, bitmap }, [bitmap]);
+          if (format === "jpeg") {
+            const bitmap = await createImageBitmap(new Blob([bytes], { type: "image/jpeg" }), {
+              premultiplyAlpha: "none",
+              colorSpaceConversion: "none",
+            });
+            const canvas = new OffscreenCanvas(bitmap.width, bitmap.height);
+            const ctx = canvas.getContext("2d");
+            if (!ctx) throw new Error("no 2d");
+            ctx.drawImage(bitmap, 0, 0);
+            const image = ctx.getImageData(0, 0, bitmap.width, bitmap.height);
+            const rgb = new Uint8Array(bitmap.width * bitmap.height * 3);
+            for (let i = 0, j = 0; i < image.data.length; i += 4, j += 3) {
+              rgb[j] = image.data[i];
+              rgb[j + 1] = image.data[i + 1];
+              rgb[j + 2] = image.data[i + 2];
+            }
+            bitmap.close();
+            self.postMessage({ id, rgb, width: bitmap.width, height: bitmap.height }, [rgb.buffer]);
+            return;
+          }
+          self.postMessage({ id, rgb: bytes, width, height }, [bytes.buffer]);
         } catch (error) {
           self.postMessage({ id, error: String(error) });
         }
@@ -600,16 +622,6 @@ function createJpegDecodeWorker(): Worker | null {
   } catch {
     return null;
   }
-}
-
-function decodeJpegBase64(data: string): Promise<ImageBitmap> {
-  const binary = atob(data);
-  const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
-  return createImageBitmap(new Blob([bytes], { type: "image/jpeg" }), {
-    premultiplyAlpha: "none",
-    colorSpaceConversion: "none",
-  });
 }
 
 function makePreviewProgram(gl: WebGLRenderingContext | WebGL2RenderingContext): WebGLProgram | null {

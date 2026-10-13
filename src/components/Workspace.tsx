@@ -1128,25 +1128,32 @@ function TextAttachmentPreview({ attachment, src }: { attachment: Attachment; sr
     let cancelled = false;
     setText(null);
     setError(false);
-    const url = attachment.url || src;
     // Discord CDN blocks browser CORS — pull through the Tauri backend instead.
-    void fetchAttachmentText(url)
-      .catch(async () => {
-        const response = await fetch(src);
-        if (!response.ok) throw new Error("fetch failed");
-        return response.text();
-      })
-      .then((body) => {
-        if (cancelled) return;
-        setText(body.length > 80_000 ? `${body.slice(0, 80_000)}\n…` : body);
-      })
-      .catch(() => {
-        if (!cancelled) setError(true);
-      });
+    const load = async () => {
+      const candidates = [attachment.url, src, attachment.proxyUrl].filter(
+        (value, index, list): value is string => Boolean(value) && list.indexOf(value) === index,
+      );
+      let lastError: unknown = null;
+      for (const candidate of candidates) {
+        try {
+          const body = await fetchAttachmentText(candidate);
+          if (cancelled) return;
+          setText(body.length > 80_000 ? `${body.slice(0, 80_000)}\n…` : body);
+          return;
+        } catch (error) {
+          lastError = error;
+        }
+      }
+      if (!cancelled) {
+        console.warn("attachment preview failed", lastError);
+        setError(true);
+      }
+    };
+    void load();
     return () => {
       cancelled = true;
     };
-  }, [attachment.url, src]);
+  }, [attachment.url, attachment.proxyUrl, src]);
   return (
     <div className="max-w-lg overflow-hidden rounded-md border border-line bg-[#0e0e0e]">
       <div className="flex items-center justify-between gap-2 border-b border-white/5 px-3 py-1.5">

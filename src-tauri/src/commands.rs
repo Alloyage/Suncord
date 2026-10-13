@@ -237,7 +237,10 @@ pub fn capture_set_preview(state: State<'_, AppState>, enabled: bool) {
 
 /// Fetch Discord CDN attachment bytes as text (bypasses WebView CORS for previews).
 #[tauri::command]
-pub async fn fetch_attachment_text(url: String) -> Result<String, String> {
+pub async fn fetch_attachment_text(
+    state: State<'_, AppState>,
+    url: String,
+) -> Result<String, String> {
     let parsed = url::Url::parse(&url).map_err(|_| "That attachment URL is invalid.".to_string())?;
     if parsed.scheme() != "http" && parsed.scheme() != "https" {
         return Err("Only http(s) attachment URLs can be previewed.".into());
@@ -254,29 +257,58 @@ pub async fn fetch_attachment_text(url: String) -> Result<String, String> {
     }
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(20))
+        .redirect(reqwest::redirect::Policy::limited(5))
         .build()
         .map_err(|err| err.to_string())?;
-    let response = client
-        .get(parsed)
+    // Signed CDN URLs usually work anonymously; fall back to the user token for
+    // attachments that still require Authorization.
+    let mut request = client
+        .get(parsed.clone())
         .header(
             reqwest::header::USER_AGENT,
-            "Mozilla/5.0 (compatible; Suncord/0.1)",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
         )
+        .header(reqwest::header::ACCEPT, "text/plain,text/*,*/*");
+    if let Some(token) = state.auth.token() {
+        request = request.header(reqwest::header::AUTHORIZATION, token.as_str());
+    }
+    let response = request
         .send()
         .await
         .map_err(|err| format!("Could not download attachment: {err}"))?;
     if !response.status().is_success() {
-        return Err(format!(
-            "Attachment download failed (HTTP {}).",
-            response.status().as_u16()
-        ));
+        // Retry once without Authorization — some CDN edges reject authed GETs.
+        let retry = client
+            .get(parsed)
+            .header(
+                reqwest::header::USER_AGENT,
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+            )
+            .send()
+            .await
+            .map_err(|err| format!("Could not download attachment: {err}"))?;
+        if !retry.status().is_success() {
+            return Err(format!(
+                "Attachment download failed (HTTP {}).",
+                retry.status().as_u16()
+            ));
+        }
+        return read_attachment_text(retry).await;
     }
+    read_attachment_text(response).await
+}
+
+async fn read_attachment_text(response: reqwest::Response) -> Result<String, String> {
     let bytes = response
         .bytes()
         .await
         .map_err(|err| format!("Could not read attachment: {err}"))?;
     if bytes.len() > 512_000 {
         return Err("That text attachment is too large to preview.".into());
+    }
+    // Detect accidental HTML/error pages masquerading as text.
+    if bytes.starts_with(b"<!DOCTYPE") || bytes.starts_with(b"<html") {
+        return Err("Attachment download returned an HTML error page.".into());
     }
     let text = String::from_utf8_lossy(&bytes).into_owned();
     if text.len() > 80_000 {

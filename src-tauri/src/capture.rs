@@ -1,6 +1,5 @@
 use crate::models::{CaptureFrame, CaptureStats, SourceDto};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
-use image::{codecs::jpeg::JpegEncoder, ColorType, ImageEncoder};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter};
@@ -229,8 +228,8 @@ fn loop_capture(app: AppHandle, commands: std::sync::mpsc::Receiver<CapCmd>) {
             if preview_tx.try_send(std::sync::Arc::new(frame)).is_err() {
                 dropped = dropped.saturating_add(1);
             } else if fresh {
-                // Only credit freshly captured buffers toward capture FPS / bitrate.
-                bytes = bytes.saturating_add((width as u64) * (height as u64) * 3 / 8);
+                // Raw RGB preview payload size (matches WebGL upload bitrate).
+                bytes = bytes.saturating_add((width as u64) * (height as u64) * 3);
                 frames += 1;
             }
         } else if fresh {
@@ -496,8 +495,9 @@ fn emit(app: &AppHandle, stats: CaptureStats) {
 }
 
 fn emit_preview(app: &AppHandle, frame: &Frame) {
-    // 640px / q=52 keeps encode under ~12ms so the preview worker holds 60 FPS.
-    let max_w = 640u32;
+    // Stream raw RGB into WebGL — no JPEG encode on the hot path.
+    // 960px keeps IPC under ~1.5 MB/frame while looking sharp at 60 FPS.
+    let max_w = 960u32;
     let (width, height, rgba) = if frame.width > max_w {
         let width = max_w;
         let height = ((frame.height as u64 * width as u64) / frame.width.max(1) as u64).max(2) as u32;
@@ -522,21 +522,15 @@ fn emit_preview(app: &AppHandle, frame: &Frame) {
     let scale_y = height as f32 / frame.height.max(1) as f32;
     paint_software_cursor(&mut painted, origin_x, origin_y, scale_x, scale_y);
     let rgb = rgba_to_rgb(painted.rgba.as_ref());
-    let mut jpeg = Vec::with_capacity((width * height) as usize / 6);
-    let encoder = JpegEncoder::new_with_quality(&mut jpeg, 52);
-    if encoder
-        .write_image(&rgb, width, height, ColorType::Rgb8.into())
-        .is_ok()
-    {
-        let _ = app.emit(
-            "suncord://capture-frame",
-            CaptureFrame {
-                width,
-                height,
-                png_base64: BASE64.encode(jpeg),
-            },
-        );
-    }
+    let _ = app.emit(
+        "suncord://capture-frame",
+        CaptureFrame {
+            width,
+            height,
+            format: "rgb".into(),
+            png_base64: BASE64.encode(rgb),
+        },
+    );
 }
 
 fn rgba_to_rgb(rgba: &[u8]) -> Vec<u8> {

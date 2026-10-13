@@ -1,11 +1,11 @@
 use crate::asr::AsrHandle;
-use crate::audio::{AudioIo, AudioPump, PcmFrame, PIPELINE_CHANNELS, PIPELINE_RATE};
+use crate::audio::{AudioIo, AudioPump, PlaybackPump, PcmFrame, PIPELINE_CHANNELS, PIPELINE_RATE};
 use crate::auth::AuthStore;
 use crate::cache::CacheStore;
 use crate::crypto::{self, TransportMode};
 use crate::dave::DaveSession;
 use crate::gateway::GatewayHandle;
-use crate::opus_codec::Encoder;
+use crate::opus_codec::{Decoder, Encoder, FRAME_SAMPLES, SILENCE_OPUS};
 use crate::models::{encoder_name, Settings, VoiceMemberDto, VoiceSignal, VoiceStatus};
 use crate::rest::DiscordRest;
 use std::collections::HashMap;
@@ -727,6 +727,22 @@ fn is_dave_required(err: &str) -> bool {
         || err.to_ascii_lowercase().contains("e2ee")
 }
 
+/// Latest mic frame, or silence if the capture pump has nothing ready.
+/// `None` only when the PCM channel is permanently closed.
+fn take_pcm_frame(pcm: &mut mpsc::Receiver<Vec<f32>>) -> Option<Vec<f32>> {
+    let mut latest: Option<Vec<f32>> = None;
+    loop {
+        match pcm.try_recv() {
+            Ok(samples) if samples.len() == FRAME_SAMPLES * 2 => latest = Some(samples),
+            Ok(_) => {}
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                return Some(latest.unwrap_or_else(|| vec![0.0f32; FRAME_SAMPLES * 2]));
+            }
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => return latest,
+        }
+    }
+}
+
 fn stop_rtp(rtp: &mut Option<RtpOut>) {
     if let Some(mut link) = rtp.take() {
         if let Some(stop) = link.stop.take() {
@@ -923,21 +939,44 @@ async fn connect_voice(
         .to_string(),
     );
     let mut encoder = Encoder::new()?;
+    let mut decoder = Decoder::new()?;
+    let playback = PlaybackPump::start(String::new());
     let mut sequence = 0u16;
     let mut timestamp = 0u32;
     let mut nonce = 0u32;
-    let mut inbound = [0u8; 2048];
+    let mut inbound = [0u8; 4096];
+    // Always emit 20 ms RTP (mic PCM or silence) so the SFU keeps the socket alive
+    // even when no input device is available.
+    let mut tick = tokio::time::interval(Duration::from_millis(20));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
             _ = &mut stop => break,
             received = udp.recv(&mut inbound) => {
                 if let Ok(size) = received {
-                    let _ = crypto::open(mode, &key, &inbound[..size]);
+                    if let Ok(payload) = crypto::open(mode, &key, &inbound[..size]) {
+                        let opus = dave.open_media(&payload);
+                        if !opus.is_empty() {
+                            if let Ok(samples) = decoder.decode(opus) {
+                                playback.push(samples);
+                            }
+                        }
+                    }
                 }
             }
-            frame = pcm.recv() => {
-                let Some(frame) = frame else { break; };
-                let Ok(opus) = encoder.encode(&frame) else { continue; };
+            _ = tick.tick() => {
+                let frame = match take_pcm_frame(&mut pcm) {
+                    Some(frame) => frame,
+                    None => break, // channel closed
+                };
+                let opus = if frame.iter().all(|sample| *sample == 0.0) {
+                    SILENCE_OPUS.to_vec()
+                } else {
+                    match encoder.encode(&frame) {
+                        Ok(packet) => packet,
+                        Err(_) => continue,
+                    }
+                };
                 let payload = dave.seal_media(&opus);
                 let header = crypto::rtp_header(sequence, timestamp, ready.ssrc);
                 if let Ok(packet) = crypto::seal(mode, &key, &header, &payload, nonce) {
@@ -951,6 +990,7 @@ async fn connect_voice(
                 match message {
                     Some(Ok(Message::Close(frame))) => {
                         heartbeat.abort();
+                        playback.stop();
                         drop(text_tx);
                         let _ = writer.await;
                         return Err(close_error(&frame));
@@ -963,6 +1003,7 @@ async fn connect_voice(
                     }
                     Some(Err(err)) => {
                         heartbeat.abort();
+                        playback.stop();
                         drop(text_tx);
                         let _ = writer.await;
                         return Err(format!("voice websocket error: {err}"));
@@ -972,6 +1013,7 @@ async fn connect_voice(
             }
         }
     }
+    playback.stop();
     heartbeat.abort();
     drop(text_tx);
     let _ = writer.await;
