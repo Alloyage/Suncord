@@ -42,6 +42,17 @@ impl DiscordRest {
         self.get(token, "/users/@me/settings").await
     }
 
+    /// Start/join a private-channel call so Discord emits voice server credentials.
+    pub async fn join_call(&self, token: &Zeroizing<String>, channel_id: &str) -> Result<(), String> {
+        self.put(
+            token,
+            &format!("/channels/{channel_id}/call"),
+            json!({ "region": serde_json::Value::Null }),
+        )
+        .await
+        .map(|_| ())
+    }
+
     /// Partial guild list with name + icon — fills READY unavailable stubs.
     pub async fn user_guilds(&self, token: &Zeroizing<String>) -> Result<Vec<GuildDto>, String> {
         let value = self.get(token, "/users/@me/guilds?with_counts=false").await?;
@@ -181,6 +192,16 @@ impl DiscordRest {
         body: serde_json::Value,
     ) -> Result<serde_json::Value, String> {
         self.send(token, reqwest::Method::PATCH, path, Some(body))
+            .await
+    }
+
+    async fn put(
+        &self,
+        token: &Zeroizing<String>,
+        path: &str,
+        body: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        self.send(token, reqwest::Method::PUT, path, Some(body))
             .await
     }
 

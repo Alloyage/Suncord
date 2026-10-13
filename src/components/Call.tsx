@@ -418,10 +418,12 @@ function WebGLCapturePreview({ className }: { className?: string }) {
   const canvas = useRef<HTMLCanvasElement>(null);
   const latest = useRef<CaptureFrame | null>(null);
   const bitmap = useRef<ImageBitmap | null>(null);
+  const dirty = useRef(false);
 
   useEffect(() => {
     const node = canvas.current;
-    const gl = node?.getContext("webgl2") ?? node?.getContext("webgl");
+    const gl = node?.getContext("webgl2", { antialias: false, powerPreference: "high-performance" })
+      ?? node?.getContext("webgl", { antialias: false, powerPreference: "high-performance" });
     if (!node || !gl) return;
     const program = makePreviewProgram(gl);
     const texture = gl.createTexture();
@@ -434,41 +436,47 @@ function WebGLCapturePreview({ className }: { className?: string }) {
     let cancelled = false;
     let decoding = false;
     let animation = 0;
+    const pumpDecode = () => {
+      if (cancelled || decoding) return;
+      const frame = latest.current;
+      if (!frame) return;
+      latest.current = null;
+      decoding = true;
+      decodeJpegBase64(frame.pngBase64)
+        .then((next) => {
+          decoding = false;
+          if (cancelled) {
+            next.close();
+            return;
+          }
+          bitmap.current?.close();
+          bitmap.current = next;
+          dirty.current = true;
+          if (node.width !== next.width || node.height !== next.height) {
+            node.width = next.width;
+            node.height = next.height;
+          }
+          // Immediately start the next pending frame — never wait on vsync to decode.
+          if (latest.current) pumpDecode();
+        })
+        .catch(() => {
+          decoding = false;
+          if (latest.current) pumpDecode();
+        });
+    };
     void import("@tauri-apps/api/event").then(({ listen }) =>
       listen<CaptureFrame>("suncord://capture-frame", (event) => {
-        // Always keep the newest frame; drop backlog while decoding.
         latest.current = event.payload;
+        pumpDecode();
       }).then((stop) => {
         if (cancelled) stop();
         else unlisten = stop;
       }),
     );
     const draw = () => {
-      const frame = latest.current;
-      if (frame && !decoding) {
-        latest.current = null;
-        decoding = true;
-        decodePng(frame.pngBase64)
-          .then((next) => {
-            decoding = false;
-            if (cancelled) return next.close();
-            bitmap.current?.close();
-            bitmap.current = next;
-            if (node.width !== next.width || node.height !== next.height) {
-              node.width = next.width;
-              node.height = next.height;
-            }
-            // If a newer frame arrived while decoding, paint it on the next tick.
-            if (latest.current) {
-              requestAnimationFrame(draw);
-            }
-          })
-          .catch(() => {
-            decoding = false;
-          });
-      }
       const image = bitmap.current;
-      if (image) {
+      if (image && dirty.current) {
+        dirty.current = false;
         gl.viewport(0, 0, node.width, node.height);
         gl.useProgram(program);
         gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
@@ -477,6 +485,8 @@ function WebGLCapturePreview({ className }: { className?: string }) {
         gl.bindTexture(gl.TEXTURE_2D, texture);
         gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
         gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
         gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, image);
         gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
       }
@@ -497,11 +507,16 @@ function WebGLCapturePreview({ className }: { className?: string }) {
   return <canvas ref={canvas} className={className ?? "h-full w-full object-contain"} aria-label="Screen share preview" />;
 }
 
-function decodePng(data: string): Promise<ImageBitmap> {
-  const bytes = Uint8Array.from(atob(data), (char) => char.charCodeAt(0));
-  // Capture now ships JPEG; keep image/png fallback for older payloads.
-  const jpeg = bytes.length > 2 && bytes[0] === 0xff && bytes[1] === 0xd8;
-  return createImageBitmap(new Blob([bytes], { type: jpeg ? "image/jpeg" : "image/png" }));
+function decodeJpegBase64(data: string): Promise<ImageBitmap> {
+  // data: URL decode is faster than atob → Uint8Array → Blob for large JPEGs.
+  return fetch(`data:image/jpeg;base64,${data}`)
+    .then((response) => response.blob())
+    .then((blob) =>
+      createImageBitmap(blob, {
+        premultiplyAlpha: "none",
+        colorSpaceConversion: "none",
+      }),
+    );
 }
 
 function makePreviewProgram(gl: WebGLRenderingContext | WebGL2RenderingContext): WebGLProgram | null {

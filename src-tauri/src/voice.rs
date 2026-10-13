@@ -1,11 +1,13 @@
 use crate::asr::AsrHandle;
 use crate::audio::{AudioIo, AudioPump, PcmFrame, PIPELINE_CHANNELS, PIPELINE_RATE};
+use crate::auth::AuthStore;
 use crate::cache::CacheStore;
 use crate::crypto::{self, TransportMode};
 use crate::dave::DaveSession;
 use crate::gateway::GatewayHandle;
 use crate::opus_codec::Encoder;
 use crate::models::{encoder_name, Settings, VoiceMemberDto, VoiceSignal, VoiceStatus};
+use crate::rest::DiscordRest;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use futures_util::{SinkExt, StreamExt};
@@ -46,6 +48,8 @@ impl VoiceHandle {
         app: AppHandle,
         gateway: GatewayHandle,
         cache: Arc<CacheStore>,
+        auth: AuthStore,
+        rest: DiscordRest,
         mut signals: mpsc::UnboundedReceiver<VoiceSignal>,
         mut frames: mpsc::Receiver<PcmFrame>,
         audio: AudioPump,
@@ -60,7 +64,10 @@ impl VoiceHandle {
         });
         let cmd_tx = tx.clone();
         tauri::async_runtime::spawn(async move {
-            run(app, gateway, cache, audio, asr, cmd_tx, &mut rx, &mut frames).await;
+            run(
+                app, gateway, cache, auth, rest, audio, asr, cmd_tx, &mut rx, &mut frames,
+            )
+            .await;
         });
         Self { tx }
     }
@@ -111,6 +118,8 @@ async fn run(
     app: AppHandle,
     gateway: GatewayHandle,
     cache: Arc<CacheStore>,
+    auth: AuthStore,
+    rest: DiscordRest,
     audio: AudioPump,
     asr: AsrHandle,
     commands_tx: mpsc::UnboundedSender<VCmd>,
@@ -189,6 +198,18 @@ async fn run(
                         status.members = members.values().cloned().collect();
                         sync_audio(&audio, &settings, true);
                         emit_status(&app, &status);
+                        // Private calls need REST /call before Discord emits VOICE_SERVER_UPDATE.
+                        if guild_id.is_none() {
+                            if let Some(token) = auth.token() {
+                                let rest = rest.clone();
+                                let call_channel = channel_id.clone();
+                                tauri::async_runtime::spawn(async move {
+                                    if let Err(err) = rest.join_call(&token, &call_channel).await {
+                                        log::warn!("voice REST call join: {err}");
+                                    }
+                                });
+                            }
+                        }
                         request_voice_server(
                             &gateway,
                             &app,
@@ -474,11 +495,15 @@ fn apply_signal(pending: &mut Pending, signal: VoiceSignal, self_id: Option<&str
             endpoint,
             token,
         } => {
-            if !voice_guild_matches(
+            let matches = voice_guild_matches(
                 pending.guild_id.as_ref(),
                 pending.channel_id.as_str(),
                 guild_id.as_ref(),
-            ) {
+            );
+            // First credentials for this join always win — Discord DM servers use channel id
+            // as guild_id and some payloads omit it entirely.
+            let accept_first = pending.token.is_none() && pending.endpoint.is_none();
+            if !matches && !accept_first {
                 log::warn!(
                     "voice server ignored (guild mismatch pending={:?} incoming={:?} channel={})",
                     pending.guild_id,
@@ -489,11 +514,10 @@ fn apply_signal(pending: &mut Pending, signal: VoiceSignal, self_id: Option<&str
             }
             let mut rotated = false;
             if !endpoint.is_empty() {
-                pending.endpoint = Some(endpoint);
+                pending.endpoint = Some(normalize_endpoint(&endpoint));
             }
             if !token.is_empty() {
                 let had_token = pending.token.as_ref().is_some_and(|existing| existing != &token);
-                // Only invalidate session when an already-bound token rotates (reconnect).
                 if had_token {
                     pending.session_id = None;
                     pending.session_ticket = 0;
@@ -513,6 +537,17 @@ fn apply_signal(pending: &mut Pending, signal: VoiceSignal, self_id: Option<&str
             rotated
         }
     }
+}
+
+fn normalize_endpoint(endpoint: &str) -> String {
+    endpoint
+        .trim()
+        .trim_start_matches("wss://")
+        .trim_start_matches("ws://")
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .trim_end_matches('/')
+        .to_string()
 }
 
 static VOICE_WAIT: AtomicU64 = AtomicU64::new(1);
@@ -564,21 +599,15 @@ async fn maybe_start_voice_link(
 }
 
 fn ready(pending: &Pending) -> bool {
-    let session_ok = pending
+    pending
         .session_id
         .as_ref()
-        .is_some_and(|id| !id.is_empty());
-    let endpoint_ok = pending
-        .endpoint
-        .as_ref()
-        .is_some_and(|endpoint| !endpoint.is_empty());
-    let token_ok = pending.token.as_ref().is_some_and(|token| !token.is_empty());
-    // Prefer ticket alignment after a rotate, but never block the first handshake when
-    // both VOICE_STATE and VOICE_SERVER have already arrived for this join.
-    let tickets_ok = pending.voice_ticket == 0
-        || pending.session_ticket == 0
-        || pending.session_ticket == pending.voice_ticket;
-    session_ok && endpoint_ok && token_ok && tickets_ok
+        .is_some_and(|id| !id.is_empty())
+        && pending
+            .endpoint
+            .as_ref()
+            .is_some_and(|endpoint| !endpoint.is_empty())
+        && pending.token.as_ref().is_some_and(|token| !token.is_empty())
 }
 
 fn request_voice_server(
@@ -732,20 +761,21 @@ async fn connect_voice(
     let heartbeat_tx = text_tx.clone();
     let heartbeat = tokio::spawn(async move {
         let mut nonce = 0u64;
+        // Heartbeat immediately — Discord closes voice sockets that wait a full interval
+        // before the first Opcode 3 during Identify/Ready.
         loop {
-            tokio::time::sleep(Duration::from_millis(interval.max(1))).await;
             nonce = nonce.wrapping_add(1);
-            // Voice gateway heartbeat `d` must be an integer nonce.
             let payload = json!({ "op": 3, "d": nonce }).to_string();
             if heartbeat_tx.send(payload).is_err() {
                 break;
             }
+            tokio::time::sleep(Duration::from_millis(interval.max(1))).await;
         }
     });
     if args.user_id.is_empty() || args.session_id.is_empty() || args.token.is_empty() {
         return Err("Voice identify is missing user, session, or token.".into());
     }
-    // DAVE v0 = transport-only; avoids handshake closes on servers that reject MLS.
+    // max_dave_protocol_version 0 = RTP transport only (no MLS).
     let identify = json!({
         "op": 0,
         "d": {
@@ -754,7 +784,8 @@ async fn connect_voice(
             "session_id": args.session_id,
             "token": args.token,
             "video": false,
-            "streams": []
+            "streams": [],
+            "max_dave_protocol_version": 0
         }
     });
     text_tx
@@ -767,13 +798,22 @@ async fn connect_voice(
         &args.session_id[..args.session_id.len().min(8)]
     );
     let ready = next_op(&mut read, &mut stop, &mut dave, &text_tx, 2).await?;
-    log::info!("voice Ready ssrc={} {}:{}", ready["d"]["ssrc"], ready["d"]["ip"], ready["d"]["port"]);
-    let ready: VoiceReady = serde_json::from_value(ready["d"].clone()).map_err(|err| err.to_string())?;
-    let mode = TransportMode::choose(&ready.modes).ok_or("The voice server offered no supported encryption mode.")?;
-    let udp = UdpSocket::bind("0.0.0.0:0").await.map_err(|err| err.to_string())?;
-    udp.connect((ready.ip.as_str(), ready.port))
+    log::info!(
+        "voice Ready ssrc={} {}:{}",
+        ready["d"]["ssrc"],
+        ready["d"]["ip"],
+        ready["d"]["port"]
+    );
+    let ready: VoiceReady =
+        serde_json::from_value(ready["d"].clone()).map_err(|err| err.to_string())?;
+    let mode = TransportMode::choose(&ready.modes)
+        .ok_or("The voice server offered no supported encryption mode.")?;
+    let udp = UdpSocket::bind("0.0.0.0:0")
         .await
         .map_err(|err| err.to_string())?;
+    udp.connect((ready.ip.as_str(), ready.port))
+        .await
+        .map_err(|err| format!("UDP connect {}:{} — {err}", ready.ip, ready.port))?;
     udp.send(&crypto::discovery_packet(ready.ssrc))
         .await
         .map_err(|err| err.to_string())?;
@@ -785,12 +825,18 @@ async fn connect_voice(
             result.map_err(|_| "IP discovery timed out".to_string())?.map_err(|err| err.to_string())?;
         }
     }
-    let (address, port) = crypto::parse_discovery(&discovery).ok_or("IP discovery was unreadable.")?;
+    let (address, port) =
+        crypto::parse_discovery(&discovery).ok_or("IP discovery was unreadable.")?;
+    log::info!("voice IP discovery local={address}:{port} mode={}", mode.discord_name());
     let select = json!({
         "op": 1,
         "d": {
             "protocol": "udp",
-            "data": { "address": address, "port": port, "mode": mode.discord_name() }
+            "data": {
+                "address": address,
+                "port": port,
+                "mode": mode.discord_name()
+            }
         }
     });
     text_tx
@@ -800,7 +846,10 @@ async fn connect_voice(
     let described: SessionDescription =
         serde_json::from_value(described["d"].clone()).map_err(|err| err.to_string())?;
     if described.secret_key.len() != 32 {
-        return Err("The voice key was not 32 bytes.".into());
+        return Err(format!(
+            "The voice key was {} bytes (expected 32).",
+            described.secret_key.len()
+        ));
     }
     let mut key = [0u8; 32];
     key.copy_from_slice(&described.secret_key);
@@ -947,17 +996,18 @@ async fn next_op(
 }
 
 fn voice_url(endpoint: &str) -> String {
-    let host = endpoint
-        .trim()
-        .trim_start_matches("wss://")
-        .trim_start_matches("https://")
-        .split('/')
-        .next()
-        .unwrap_or(endpoint)
-        .split(':')
-        .next()
-        .unwrap_or(endpoint);
-    format!("wss://{host}/?v=8")
+    // VOICE_SERVER_UPDATE endpoint looks like `host.discord.media:443`.
+    let cleaned = normalize_endpoint(endpoint);
+    let host = cleaned.split('/').next().unwrap_or(cleaned.as_str());
+    let (name, port) = match host.rsplit_once(':') {
+        Some((name, port)) if port.parse::<u16>().is_ok() => (name, port),
+        _ => (host, "443"),
+    };
+    if port == "443" {
+        format!("wss://{name}/?v=8")
+    } else {
+        format!("wss://{name}:{port}/?v=8")
+    }
 }
 
 fn sync_audio(audio: &AudioPump, settings: &Settings, running: bool) {

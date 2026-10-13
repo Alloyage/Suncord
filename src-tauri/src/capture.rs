@@ -186,41 +186,45 @@ fn loop_capture(app: AppHandle, commands: std::sync::mpsc::Receiver<CapCmd>) {
         let interval = Duration::from_secs_f64(1.0 / target_fps as f64);
         let tick = Instant::now();
 
-        // Drain WGC/desktop-duplication to the newest buffer; never block the pace loop.
+        // Only push a preview when WGC delivered a new buffer — re-JPEGing a stale
+        // last_frame at 60 Hz burns CPU and looks choppy when motion finally arrives.
+        let mut fresh = false;
         if let Some(stream) = display_stream.as_ref() {
             if let Some(frame) = stream.drain_latest() {
                 last_frame = Some(frame);
+                fresh = true;
             }
         } else if last_frame.is_none() || tick >= next_emit {
             match grab(&id) {
-                Ok(frame) => last_frame = Some(frame),
+                Ok(frame) => {
+                    last_frame = Some(frame);
+                    fresh = true;
+                }
                 Err(_) => dropped = dropped.saturating_add(1),
             }
         }
 
-        if tick < next_emit {
-            let remain = next_emit - tick;
+        if !fresh {
+            let remain = if next_emit > tick {
+                next_emit - tick
+            } else {
+                Duration::ZERO
+            };
             if remain > Duration::from_millis(1) {
-                thread::sleep(remain - Duration::from_micros(200));
+                thread::sleep(remain.min(Duration::from_millis(4)));
             } else {
                 std::hint::spin_loop();
             }
             continue;
         }
-        // Steady cadence — catch up instead of drifting behind after a hitch.
-        next_emit += interval;
-        if next_emit + interval < tick {
-            next_emit = tick + interval;
-        }
 
+        next_emit = tick + interval;
         let Some(frame) = last_frame.clone() else {
-            dropped = dropped.saturating_add(1);
             continue;
         };
         let (width, height, path) = encode(&preference, frame.width, frame.height);
         bytes = bytes.saturating_add(frame.rgba.len() as u64);
         if preview_enabled {
-            // Arc clone is cheap; preview worker scales + JPEG off the capture hot path.
             if preview_tx.try_send(std::sync::Arc::new(frame)).is_err() {
                 dropped = dropped.saturating_add(1);
             }
@@ -481,8 +485,8 @@ fn emit(app: &AppHandle, stats: CaptureStats) {
 }
 
 fn emit_preview(app: &AppHandle, frame: &Frame) {
-    // Keep preview lean so JPEG never stalls the 60 FPS capture cadence.
-    let max_w = 720u32;
+    // 540px JPEG stays under ~20ms encode so the preview worker keeps up with WGC.
+    let max_w = 540u32;
     let (width, height, rgba) = if frame.width > max_w {
         let width = max_w;
         let height = ((frame.height as u64 * width as u64) / frame.width.max(1) as u64).max(2) as u32;
@@ -507,8 +511,8 @@ fn emit_preview(app: &AppHandle, frame: &Frame) {
     let scale_y = height as f32 / frame.height.max(1) as f32;
     paint_software_cursor(&mut painted, origin_x, origin_y, scale_x, scale_y);
     let rgb = rgba_to_rgb(painted.rgba.as_ref());
-    let mut jpeg = Vec::with_capacity((width * height) as usize / 5);
-    let encoder = JpegEncoder::new_with_quality(&mut jpeg, 55);
+    let mut jpeg = Vec::with_capacity((width * height) as usize / 6);
+    let encoder = JpegEncoder::new_with_quality(&mut jpeg, 45);
     if encoder
         .write_image(&rgb, width, height, ColorType::Rgb8.into())
         .is_ok()

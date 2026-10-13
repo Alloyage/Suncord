@@ -47,6 +47,8 @@ impl AppState {
             app.clone(),
             gateway.clone(),
             Arc::new(cache.clone()),
+            auth.clone(),
+            rest.clone(),
             voice_rx,
             frame_rx,
             audio,
