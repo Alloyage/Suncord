@@ -28,6 +28,7 @@ export interface Channel {
   position: number;
   icon?: string | null;
   lastMessageId?: string | null;
+  recipientIds?: string[];
 }
 
 export interface Attachment {

@@ -245,6 +245,8 @@ struct Frame {
 struct NativeDisplayStream {
     recorder: xcap::VideoRecorder,
     frames: std::sync::mpsc::Receiver<xcap::Frame>,
+    origin_x: i32,
+    origin_y: i32,
 }
 
 impl NativeDisplayStream {
@@ -255,9 +257,16 @@ impl NativeDisplayStream {
             .into_iter()
             .find(|monitor| monitor.name().ok().as_deref() == Some(name))
             .ok_or("That display is no longer available.")?;
+        let origin_x = monitor.x().unwrap_or(0);
+        let origin_y = monitor.y().unwrap_or(0);
         let (recorder, frames) = monitor.video_recorder().map_err(|err| err.to_string())?;
         recorder.start().map_err(|err| err.to_string())?;
-        Ok(Self { recorder, frames })
+        Ok(Self {
+            recorder,
+            frames,
+            origin_x,
+            origin_y,
+        })
     }
 
     fn next_frame(&self, timeout: Duration) -> Result<Frame, String> {
@@ -266,11 +275,14 @@ impl NativeDisplayStream {
         while let Ok(newer) = self.frames.try_recv() {
             frame = newer;
         }
-        Ok(Frame {
+        let mut out = Frame {
             width: frame.width,
             height: frame.height,
             rgba: frame.raw,
-        })
+        };
+        // WGC/xcap omits the hardware cursor — composite it so viewers see the pointer.
+        paint_software_cursor(&mut out, self.origin_x, self.origin_y);
+        Ok(out)
     }
 
     fn stop(self) {
@@ -285,12 +297,16 @@ fn grab(id: &str) -> Result<Frame, String> {
             .into_iter()
             .find(|monitor| monitor.name().ok().as_deref() == Some(name))
             .ok_or("That display is no longer available.")?;
+        let origin_x = monitor.x().unwrap_or(0);
+        let origin_y = monitor.y().unwrap_or(0);
         let image = monitor.capture_image().map_err(|err| err.to_string())?;
-        return Ok(Frame {
+        let mut frame = Frame {
             width: image.width(),
             height: image.height(),
             rgba: image.into_raw(),
-        });
+        };
+        paint_software_cursor(&mut frame, origin_x, origin_y);
+        return Ok(frame);
     }
     if let Some(rest) = id.strip_prefix("window:") {
         let title = rest.split_once(':').map(|(_, title)| title).unwrap_or(rest);
@@ -299,15 +315,105 @@ fn grab(id: &str) -> Result<Frame, String> {
             .into_iter()
             .find(|window| window.title().ok().as_deref() == Some(title))
             .ok_or("That window is no longer available.")?;
+        let origin_x = window.x().unwrap_or(0);
+        let origin_y = window.y().unwrap_or(0);
         let image = window.capture_image().map_err(|err| err.to_string())?;
-        return Ok(Frame {
+        let mut frame = Frame {
             width: image.width(),
             height: image.height(),
             rgba: image.into_raw(),
-        });
+        };
+        paint_software_cursor(&mut frame, origin_x, origin_y);
+        return Ok(frame);
     }
     Err("Unknown capture source.".into())
 }
+
+#[cfg(windows)]
+fn paint_software_cursor(frame: &mut Frame, origin_x: i32, origin_y: i32) {
+    #[repr(C)]
+    struct Point {
+        x: i32,
+        y: i32,
+    }
+    #[link(name = "user32")]
+    extern "system" {
+        fn GetCursorPos(point: *mut Point) -> i32;
+        fn GetCursorInfo(info: *mut CursorInfo) -> i32;
+    }
+    #[repr(C)]
+    struct CursorInfo {
+        cb_size: u32,
+        flags: u32,
+        cursor: isize,
+        pt_screen_pos: Point,
+    }
+    const CURSOR_SHOWING: u32 = 0x0000_0001;
+    let mut info = CursorInfo {
+        cb_size: std::mem::size_of::<CursorInfo>() as u32,
+        flags: 0,
+        cursor: 0,
+        pt_screen_pos: Point { x: 0, y: 0 },
+    };
+    let visible = unsafe { GetCursorInfo(&mut info) } != 0 && (info.flags & CURSOR_SHOWING) != 0;
+    if !visible {
+        return;
+    }
+    let mut point = Point { x: 0, y: 0 };
+    if unsafe { GetCursorPos(&mut point) } == 0 {
+        point = info.pt_screen_pos;
+    }
+    let local_x = point.x.saturating_sub(origin_x);
+    let local_y = point.y.saturating_sub(origin_y);
+    if local_x < 0 || local_y < 0 {
+        return;
+    }
+    let x = local_x as u32;
+    let y = local_y as u32;
+    if x >= frame.width || y >= frame.height {
+        return;
+    }
+    // Compact arrow so the pointer stays readable at preview scale.
+    const ARROW: &[(i32, i32)] = &[
+        (0, 0), (0, 1), (0, 2), (0, 3), (0, 4), (0, 5), (0, 6), (0, 7), (0, 8), (0, 9), (0, 10),
+        (0, 11), (1, 1), (1, 2), (1, 3), (1, 4), (1, 5), (1, 6), (1, 7), (1, 8), (1, 9), (1, 10),
+        (2, 2), (2, 3), (2, 4), (2, 5), (2, 6), (2, 7), (2, 8), (2, 9), (3, 3), (3, 4), (3, 5),
+        (3, 6), (3, 7), (3, 8), (4, 4), (4, 5), (4, 6), (4, 7), (4, 10), (5, 5), (5, 6), (5, 9),
+        (5, 11), (6, 6), (6, 8), (6, 12), (7, 7), (7, 13), (8, 8), (8, 12), (9, 9), (9, 11),
+        (10, 10),
+    ];
+    let mut put = |px: i32, py: i32, r: u8, g: u8, b: u8| {
+        if px < 0 || py < 0 {
+            return;
+        }
+        let px = px as u32;
+        let py = py as u32;
+        if px >= frame.width || py >= frame.height {
+            return;
+        }
+        let idx = ((py as usize * frame.width as usize) + px as usize) * 4;
+        if idx + 3 >= frame.rgba.len() {
+            return;
+        }
+        frame.rgba[idx] = r;
+        frame.rgba[idx + 1] = g;
+        frame.rgba[idx + 2] = b;
+        frame.rgba[idx + 3] = 255;
+    };
+    for &(dx, dy) in ARROW {
+        let px = x as i32 + dx;
+        let py = y as i32 + dy;
+        for (ox, oy) in [(-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (1, 1)] {
+            put(px + ox, py + oy, 16, 16, 16);
+        }
+    }
+    for &(dx, dy) in ARROW {
+        put(x as i32 + dx, y as i32 + dy, 255, 255, 255);
+    }
+}
+
+#[cfg(not(windows))]
+fn paint_software_cursor(_frame: &mut Frame, _origin_x: i32, _origin_y: i32) {}
 
 /// GPU path keeps the native frame captured through Windows Graphics Capture.
 /// CPU path scales on the CPU so the preference changes the work that is done.

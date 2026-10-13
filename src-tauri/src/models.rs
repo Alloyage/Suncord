@@ -30,6 +30,9 @@ pub struct ChannelDto {
     pub icon: Option<String>,
     #[serde(default)]
     pub last_message_id: Option<String>,
+    /// DM / group DM peer user ids for call roster seeding.
+    #[serde(default)]
+    pub recipient_ids: Vec<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]

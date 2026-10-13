@@ -161,6 +161,17 @@ impl CacheStore {
             .map(|channel| channel.name.clone())
     }
 
+    pub fn channel_recipient_ids(&self, channel_id: &str) -> Vec<String> {
+        let inner = self.inner.read();
+        inner
+            .channels
+            .iter()
+            .chain(inner.dms.iter())
+            .find(|channel| channel.id == channel_id)
+            .map(|channel| channel.recipient_ids.clone())
+            .unwrap_or_default()
+    }
+
     pub fn user_lookup(&self, user_id: &str) -> Option<UserDto> {
         self.inner.read().users.get(user_id).cloned()
     }

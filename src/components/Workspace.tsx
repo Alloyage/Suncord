@@ -113,20 +113,34 @@ function ServerRail({
             />
           );
         }
-        const expanded = openFolders[entry.folder.id] ?? false;
-        const color = entry.folder.color != null ? `#${entry.folder.color.toString(16).padStart(6, "0")}` : "#2a2a2a";
+        const expanded =
+          openFolders[entry.folder.id] ??
+          entry.folder.guildIds.some((guildId) => guildId === activeGuildId);
+        const previewGuilds = entry.folder.guildIds
+          .map((guildId) => byId[guildId])
+          .filter(Boolean)
+          .slice(0, 4) as Guild[];
         return (
           <div key={entry.folder.id} className="flex w-full flex-col items-center gap-1">
-            <button
-              title={entry.folder.name || "Folder"}
-              onClick={() => setOpenFolders((prev) => ({ ...prev, [entry.folder.id]: !expanded }))}
-              className="flex h-12 w-12 items-center justify-center overflow-hidden rounded-2xl text-xs font-semibold text-cream"
-              style={{ background: color }}
-            >
-              {(entry.folder.name || "Folder").slice(0, 2).toUpperCase()}
-            </button>
-            {expanded
-              ? entry.folder.guildIds.map((guildId) => {
+            {!expanded ? (
+              <FolderBadge
+                title={entry.folder.name || "Folder"}
+                color={entry.folder.color}
+                guilds={previewGuilds}
+                active={entry.folder.guildIds.some((guildId) => guildId === activeGuildId)}
+                onClick={() => setOpenFolders((prev) => ({ ...prev, [entry.folder.id]: true }))}
+              />
+            ) : (
+              <>
+                <button
+                  title={`Collapse ${entry.folder.name || "folder"}`}
+                  aria-label={`Collapse ${entry.folder.name || "folder"}`}
+                  onClick={() => setOpenFolders((prev) => ({ ...prev, [entry.folder.id]: false }))}
+                  className="flex h-6 w-12 items-center justify-center rounded-md bg-[#1a1a1a] text-[10px] uppercase tracking-wide text-mute hover:bg-[#222] hover:text-cream"
+                >
+                  ▲
+                </button>
+                {entry.folder.guildIds.map((guildId) => {
                   const guild = byId[guildId];
                   if (!guild) return null;
                   return (
@@ -139,8 +153,9 @@ function ServerRail({
                       onClick={() => openGuild(guild.id)}
                     />
                   );
-                })
-              : null}
+                })}
+              </>
+            )}
           </div>
         );
       })}
@@ -181,6 +196,61 @@ function openGuild(guildId: string) {
   const next = nextChannels[0]?.id ?? null;
   useApp.getState().setPlace(guildId, next);
   if (next) void selectChannel(next, guildId).then((rows) => useApp.getState().replaceMessages(next, rows));
+}
+
+function FolderBadge({
+  title,
+  color,
+  guilds,
+  active,
+  onClick,
+}: {
+  title: string;
+  color?: number | null;
+  guilds: Guild[];
+  active: boolean;
+  onClick: () => void;
+}) {
+  const tint =
+    color != null && color >= 0
+      ? `#${color.toString(16).padStart(6, "0")}`
+      : "#1a1a1a";
+  const cells = [0, 1, 2, 3].map((index) => guilds[index] ?? null);
+  return (
+    <button
+      title={title}
+      aria-label={title}
+      onClick={onClick}
+      className={`grid h-12 w-12 shrink-0 grid-cols-2 grid-rows-2 gap-0.5 overflow-hidden rounded-2xl p-0.5 transition-all duration-150 ease-in-out ${
+        active ? "ring-2 ring-white/80" : "hover:rounded-2xl"
+      }`}
+      style={{ background: tint }}
+    >
+      {cells.map((guild, index) => (
+        <FolderCell key={guild?.id ?? `empty-${index}`} guild={guild} />
+      ))}
+    </button>
+  );
+}
+
+function FolderCell({ guild }: { guild: Guild | null }) {
+  const [broken, setBroken] = useState(false);
+  const src = guild ? resolveGuildIcon(guild.icon, guild.id) : null;
+  useEffect(() => setBroken(false), [src]);
+  const showImage = Boolean(src) && !broken;
+  return (
+    <span className="flex h-full w-full items-center justify-center overflow-hidden rounded-[4px] bg-[#0c0c0c]">
+      {showImage ? (
+        <img
+          src={src!}
+          alt=""
+          className="h-full w-full object-cover"
+          draggable={false}
+          onError={() => setBroken(true)}
+        />
+      ) : null}
+    </span>
+  );
 }
 
 function RailButton({

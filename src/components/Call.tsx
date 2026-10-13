@@ -32,10 +32,21 @@ export function CallOverlay() {
     };
   }, [sharing, expanded, inVoice]);
 
-  const participants = useMemo(
-    () => mergeParticipants(voice.members ?? [], user, voice.muted, voice.deafened, voice.level),
-    [voice.members, voice.muted, voice.deafened, voice.level, user],
-  );
+  const users = useApp((state) => state.users);
+  const dms = useApp((state) => state.dms);
+  const channels = useApp((state) => state.channels);
+  const participants = useMemo(() => {
+    const channel =
+      [...(dms ?? []), ...(channels ?? [])].find((item) => item.id === voice.channelId) ?? null;
+    return mergeParticipants(
+      voice.members ?? [],
+      user,
+      voice.muted,
+      voice.deafened,
+      channel?.recipientIds ?? [],
+      users ?? {},
+    );
+  }, [voice.members, voice.muted, voice.deafened, voice.channelId, user, users, dms, channels]);
   const count = Math.max(participants.length, inVoice ? 1 : 0);
 
   if (!inVoice && !sharing) return null;
@@ -157,14 +168,37 @@ function CallGrid({
   participants: GridParticipant[];
   speakingLevel: number;
 }) {
+  const capture = useApp((state) => state.capture);
+  const [fullscreen, setFullscreen] = useState(false);
+  useEffect(() => {
+    if (!fullscreen) return;
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setFullscreen(false);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [fullscreen]);
   const tiles: ReactNode[] = [];
   if (sharing) {
     tiles.push(
       <div
         key="share"
-        className="relative col-span-full flex min-h-[220px] items-center justify-center overflow-hidden rounded-lg bg-black ring-1 ring-white/10"
+        className={`relative col-span-full flex items-center justify-center overflow-hidden rounded-lg bg-black ring-1 ring-white/10 ${
+          fullscreen ? "fixed inset-0 z-50 min-h-0 rounded-none ring-0" : "min-h-[220px]"
+        }`}
+        onDoubleClick={() => setFullscreen((value) => !value)}
       >
         <WebGLCapturePreview className="h-full max-h-full w-full object-contain" />
+        <CaptureTelemetryBadge stats={capture} />
+        <button
+          type="button"
+          title={fullscreen ? "Exit full screen" : "Full screen"}
+          aria-label={fullscreen ? "Exit full screen" : "Full screen"}
+          onClick={() => setFullscreen((value) => !value)}
+          className="absolute bottom-3 right-3 rounded bg-black/70 px-2.5 py-1.5 text-[11px] text-cream ring-1 ring-white/15 hover:bg-black/85"
+        >
+          {fullscreen ? "Exit full screen" : "Full screen"}
+        </button>
       </div>,
     );
   }
@@ -188,6 +222,23 @@ function CallGrid({
     tiles.length === 1 ? "grid-cols-1" : tiles.length === 2 ? "grid-cols-1 md:grid-cols-2" : "grid-cols-2 lg:grid-cols-3";
 
   return <div className={`grid h-full auto-rows-fr gap-3 ${cols}`}>{tiles}</div>;
+}
+
+function CaptureTelemetryBadge({
+  stats,
+}: {
+  stats: { width?: number; height?: number; fps?: number; bitrateKbps?: number } | null | undefined;
+}) {
+  if (!stats?.width || !stats?.height) return null;
+  const fps = Math.round(stats.fps ?? 0);
+  const bitrate = Math.round(stats.bitrateKbps ?? 0);
+  return (
+    <div className="pointer-events-none absolute left-3 top-3 rounded bg-black/70 px-2 py-1 font-mono text-[11px] tabular-nums text-cream ring-1 ring-white/10">
+      {stats.width}×{stats.height}
+      {fps > 0 ? ` · ${fps} fps` : ""}
+      {bitrate > 0 ? ` · ${bitrate} kbps` : ""}
+    </div>
+  );
 }
 
 type GridParticipant = VoiceMember & { self?: boolean };
@@ -232,11 +283,24 @@ function mergeParticipants(
   user: { id: string; name: string; avatar?: string | null } | null,
   muted: boolean,
   deafened: boolean,
-  _level: number,
+  recipientIds: string[],
+  users: Record<string, { id: string; name: string; avatar?: string | null }>,
 ): GridParticipant[] {
   const byId = new Map<string, GridParticipant>();
   for (const member of members) {
     byId.set(member.id, { ...member, self: user?.id === member.id });
+  }
+  for (const recipientId of recipientIds) {
+    if (!recipientId || byId.has(recipientId)) continue;
+    const person = users[recipientId];
+    byId.set(recipientId, {
+      id: recipientId,
+      name: person?.name ?? `user ${recipientId.slice(-4)}`,
+      avatar: person?.avatar ?? null,
+      muted: false,
+      deafened: false,
+      self: false,
+    });
   }
   if (user?.id && !byId.has(user.id)) {
     byId.set(user.id, {
@@ -251,7 +315,9 @@ function mergeParticipants(
     const self = byId.get(user.id)!;
     byId.set(user.id, { ...self, muted, deafened, self: true });
   }
-  return Array.from(byId.values()).sort((a, b) => Number(Boolean(b.self)) - Number(Boolean(a.self)) || a.name.localeCompare(b.name));
+  return Array.from(byId.values()).sort(
+    (a, b) => Number(Boolean(b.self)) - Number(Boolean(a.self)) || a.name.localeCompare(b.name),
+  );
 }
 
 function CallBarButton({

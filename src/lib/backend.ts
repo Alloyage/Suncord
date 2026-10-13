@@ -180,17 +180,40 @@ export async function logout(): Promise<void> {
 }
 
 export function joinVoice(channelId: string, guildId: string | null): Promise<void> {
-  const voice = useApp.getState().voice;
+  const state = useApp.getState();
+  const voice = state.voice;
   const channel =
-    [...(useApp.getState().channels ?? []), ...(useApp.getState().dms ?? [])].find((item) => item.id === channelId) ??
-    null;
+    [...(state.channels ?? []), ...(state.dms ?? [])].find((item) => item.id === channelId) ?? null;
+  const users = state.users ?? {};
+  const self = state.user;
+  const seeded = new Map<string, { id: string; name: string; avatar?: string | null; muted: boolean; deafened: boolean }>();
+  if (self?.id) {
+    seeded.set(self.id, {
+      id: self.id,
+      name: self.name,
+      avatar: self.avatar,
+      muted: Boolean(voice.muted),
+      deafened: Boolean(voice.deafened),
+    });
+  }
+  for (const recipientId of channel?.recipientIds ?? []) {
+    if (!recipientId || seeded.has(recipientId)) continue;
+    const person = users[recipientId];
+    seeded.set(recipientId, {
+      id: recipientId,
+      name: person?.name ?? `user ${recipientId.slice(-4)}`,
+      avatar: person?.avatar ?? null,
+      muted: false,
+      deafened: false,
+    });
+  }
   useApp.getState().setVoice({
     ...voice,
     phase: "joining",
     channelId,
     channelName: channel?.name ?? voice.channelName,
     detail: "Connecting…",
-    members: [],
+    members: Array.from(seeded.values()),
   });
   return invoke("voice_join", { channelId, guildId });
 }

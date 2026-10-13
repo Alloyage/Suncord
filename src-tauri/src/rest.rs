@@ -468,6 +468,7 @@ fn dm_channel_from_value(value: &serde_json::Value) -> Option<ChannelDto> {
             None,
         ),
     };
+    let recipient_ids = wire.recipients.iter().map(|person| person.id.clone()).collect();
     Some(ChannelDto {
         id: wire.id,
         guild_id: None,
@@ -477,6 +478,7 @@ fn dm_channel_from_value(value: &serde_json::Value) -> Option<ChannelDto> {
         position: 0,
         icon,
         last_message_id: wire.last_message_id,
+        recipient_ids,
     })
 }
 

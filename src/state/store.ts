@@ -299,6 +299,9 @@ function normalizeChannel(channel: Channel): Channel {
     position: Number(channel?.position ?? 0),
     icon: channel?.icon ?? null,
     lastMessageId: channel?.lastMessageId ?? null,
+    recipientIds: Array.isArray(channel?.recipientIds)
+      ? channel.recipientIds.map((id) => String(id)).filter(Boolean)
+      : [],
   };
 }
 

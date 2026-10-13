@@ -167,11 +167,13 @@ async fn run(
                     VCmd::Join { guild_id, channel_id } => {
                         stop_rtp(&mut rtp);
                         members.clear();
+                        let self_user_id = cache.user_id();
+                        seed_call_roster(&cache, &mut members, &channel_id, self_user_id.as_deref());
                         let wait_ticket = voice_wait_ticket();
                         pending = Some(Pending {
                             guild_id: guild_id.clone(),
                             channel_id: channel_id.clone(),
-                            self_user_id: cache.user_id(),
+                            self_user_id: self_user_id.clone(),
                             session_id: None,
                             endpoint: None,
                             token: None,
@@ -184,7 +186,7 @@ async fn run(
                         status.channel_name = cache.channel_name(&channel_id);
                         status.detail = "Connecting…".into();
                         status.encoder = encoder_name();
-                        status.members.clear();
+                        status.members = members.values().cloned().collect();
                         sync_audio(&audio, &settings, true);
                         emit_status(&app, &status);
                         request_voice_server(
@@ -352,10 +354,65 @@ fn track_member(
     );
 }
 
-fn voice_guild_matches(pending: Option<&String>, incoming: Option<&String>) -> bool {
-    match (pending, incoming) {
+fn voice_guild_matches(
+    pending_guild: Option<&String>,
+    pending_channel: &str,
+    incoming: Option<&String>,
+) -> bool {
+    match (pending_guild, incoming) {
         (Some(a), Some(b)) => a == b,
-        _ => true,
+        // Private calls: Opcode 4 uses guild_id null; VOICE_SERVER_UPDATE uses the channel id.
+        (None, Some(b)) => b == pending_channel,
+        (None, None) => true,
+        (Some(_), None) => true,
+    }
+}
+
+fn seed_call_roster(
+    cache: &CacheStore,
+    members: &mut HashMap<String, VoiceMemberDto>,
+    channel_id: &str,
+    self_id: Option<&str>,
+) {
+    if let Some(self_id) = self_id {
+        let profile = cache.user_lookup(self_id);
+        members.insert(
+            self_id.to_string(),
+            VoiceMemberDto {
+                id: self_id.to_string(),
+                name: profile
+                    .as_ref()
+                    .map(|user| user.name.clone())
+                    .unwrap_or_else(|| "You".into()),
+                avatar: profile.and_then(|user| user.avatar),
+                muted: false,
+                deafened: false,
+            },
+        );
+    }
+    for recipient_id in cache.channel_recipient_ids(channel_id) {
+        if self_id == Some(recipient_id.as_str()) {
+            continue;
+        }
+        let profile = cache.user_lookup(&recipient_id);
+        members.insert(
+            recipient_id.clone(),
+            VoiceMemberDto {
+                id: recipient_id.clone(),
+                name: profile
+                    .as_ref()
+                    .map(|user| user.name.clone())
+                    .unwrap_or_else(|| {
+                        format!(
+                            "user {}",
+                            &recipient_id[recipient_id.len().saturating_sub(4)..]
+                        )
+                    }),
+                avatar: profile.and_then(|user| user.avatar),
+                muted: false,
+                deafened: false,
+            },
+        );
     }
 }
 
@@ -371,7 +428,11 @@ fn apply_signal(pending: &mut Pending, signal: VoiceSignal, self_id: Option<&str
             if channel_id.as_deref() != Some(pending.channel_id.as_str()) {
                 return false;
             }
-            if !voice_guild_matches(pending.guild_id.as_ref(), guild_id.as_ref()) {
+            if !voice_guild_matches(
+                pending.guild_id.as_ref(),
+                pending.channel_id.as_str(),
+                guild_id.as_ref(),
+            ) {
                 return false;
             }
             // Never adopt another member's session_id — that produces voice close 4006.
@@ -391,7 +452,11 @@ fn apply_signal(pending: &mut Pending, signal: VoiceSignal, self_id: Option<&str
             endpoint,
             token,
         } => {
-            if !voice_guild_matches(pending.guild_id.as_ref(), guild_id.as_ref()) {
+            if !voice_guild_matches(
+                pending.guild_id.as_ref(),
+                pending.channel_id.as_str(),
+                guild_id.as_ref(),
+            ) {
                 return false;
             }
             let mut rotated = false;

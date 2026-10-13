@@ -758,7 +758,7 @@ struct WireChannel {
 
 #[derive(Deserialize)]
 struct WireRecipient {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_snowflake")]
     id: String,
     #[serde(default)]
     username: String,
@@ -832,6 +832,7 @@ fn channel_from_value_with_users(
         }
     };
 
+    let recipient_ids = users.iter().map(|person| person.id.clone()).collect();
     Some((
         ChannelDto {
             id: wire.id,
@@ -842,6 +843,7 @@ fn channel_from_value_with_users(
             position: wire.position.unwrap_or(0),
             icon,
             last_message_id: wire.last_message_id,
+            recipient_ids,
         },
         users,
     ))
@@ -917,7 +919,7 @@ fn parse_guild_folders(
                 .and_then(|value| value.as_array())
                 .map(|rows| {
                     rows.iter()
-                        .filter_map(|row| row.as_str().map(str::to_string))
+                        .filter_map(snowflake_string)
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default();
@@ -997,10 +999,11 @@ fn parse_guild_folders(
 
 #[derive(Deserialize)]
 struct WireVoiceState {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_opt_snowflake")]
     guild_id: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_opt_snowflake")]
     channel_id: Option<String>,
+    #[serde(deserialize_with = "deserialize_snowflake")]
     user_id: String,
     #[serde(default)]
     session_id: String,
@@ -1016,12 +1019,32 @@ struct WireVoiceState {
 
 #[derive(Deserialize)]
 struct WireVoiceServer {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_opt_snowflake")]
     guild_id: Option<String>,
     #[serde(default)]
     endpoint: Option<String>,
     #[serde(default)]
     token: Option<String>,
+}
+
+fn deserialize_snowflake<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    snowflake_string(&value).ok_or_else(|| serde::de::Error::custom("expected snowflake"))
+}
+
+fn deserialize_opt_snowflake<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value.as_ref().and_then(snowflake_string))
+}
+
+fn snowflake_string(value: &serde_json::Value) -> Option<String> {
+    value
+        .as_str()
+        .map(str::to_string)
+        .or_else(|| value.as_u64().map(|n| n.to_string()))
+        .or_else(|| value.as_i64().map(|n| n.to_string()))
 }
 
 fn gateway_url(resume: Option<&str>) -> String {
