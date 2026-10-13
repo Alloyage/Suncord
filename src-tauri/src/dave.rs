@@ -61,6 +61,9 @@ impl DaveSession {
         self.version = version;
         if version == 0 {
             self.phase = Phase::Transport;
+        } else if self.phase == Phase::Transport {
+            // Session Description selected DAVE — wait for MLS opcodes before sealing.
+            self.phase = Phase::ExternalSender;
         }
     }
 

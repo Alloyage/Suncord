@@ -103,10 +103,17 @@ export function useBackend(): void {
     })();
 
     const syncActiveChannel = () => {
-      const { signedIn, activeChannelId, activeGuildId } = useApp.getState();
+      const { signedIn, activeChannelId, activeGuildId, voice } = useApp.getState();
       if (!signedIn || !activeChannelId) return;
-      void selectChannel(activeChannelId, activeGuildId)
-        .then((rows) => useApp.getState().replaceMessages(activeChannelId, rows))
+      // Avoid yanking message state while a call overlay is live — focus clicks
+      // during a call otherwise race REST history against gateway MESSAGE_CREATE.
+      if (voice?.channelId && voice.phase !== "idle") return;
+      const channelId = activeChannelId;
+      void selectChannel(channelId, activeGuildId)
+        .then((rows) => {
+          if (useApp.getState().activeChannelId !== channelId) return;
+          useApp.getState().replaceMessages(channelId, rows);
+        })
         .catch(() => undefined);
     };
     const onFocus = () => syncActiveChannel();

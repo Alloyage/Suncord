@@ -695,10 +695,17 @@ async fn spawn_link(
                 let _ = cmd.send(VCmd::RefreshSession);
             }
             Err(err) => {
+                // Stay in "joining" (not "error") so the call overlay stays pinned
+                // while LinkDead reconnects — avoids chat flicker during transport flaps.
                 log::warn!("voice: {err}");
-                fail.phase = "error".into();
-                fail.detail = err.clone();
+                fail.phase = "joining".into();
+                fail.detail = if is_dave_required(&err) {
+                    "Negotiating voice encryption…".into()
+                } else {
+                    format!("Reconnecting… ({err})")
+                };
                 publish(&app, fail);
+                tokio::time::sleep(Duration::from_millis(500)).await;
                 let _ = cmd.send(VCmd::LinkDead);
             }
         }
@@ -711,6 +718,12 @@ async fn spawn_link(
 
 fn is_session_invalid(err: &str) -> bool {
     err.contains("4006") || err.to_ascii_lowercase().contains("session no longer valid")
+}
+
+fn is_dave_required(err: &str) -> bool {
+    err.contains("4017")
+        || err.to_ascii_lowercase().contains("dave")
+        || err.to_ascii_lowercase().contains("e2ee")
 }
 
 fn stop_rtp(rtp: &mut Option<RtpOut>) {
@@ -775,7 +788,8 @@ async fn connect_voice(
     if args.user_id.is_empty() || args.session_id.is_empty() || args.token.is_empty() {
         return Err("Voice identify is missing user, session, or token.".into());
     }
-    // max_dave_protocol_version 0 = RTP transport only (no MLS).
+    // Discord media servers close with 4017 when max_dave_protocol_version is 0/omitted.
+    // Advertise DAVE v1 so the handshake can negotiate transport + optional MLS.
     let identify = json!({
         "op": 0,
         "d": {
@@ -785,17 +799,18 @@ async fn connect_voice(
             "token": args.token,
             "video": false,
             "streams": [],
-            "max_dave_protocol_version": 0
+            "max_dave_protocol_version": DaveSession::VERSION
         }
     });
     text_tx
         .send(identify.to_string())
         .map_err(|_| "voice socket closed before IDENTIFY".to_string())?;
     log::info!(
-        "voice IDENTIFY server={} user={} session={}…",
+        "voice IDENTIFY server={} user={} session={}… dave={}",
         args.server_id,
         args.user_id,
-        &args.session_id[..args.session_id.len().min(8)]
+        &args.session_id[..args.session_id.len().min(8)],
+        DaveSession::VERSION
     );
     let ready = next_op(&mut read, &mut stop, &mut dave, &text_tx, 2).await?;
     log::info!(
@@ -945,6 +960,9 @@ fn close_error(frame: &Option<tokio_tungstenite::tungstenite::protocol::CloseFra
     if code == 4006 {
         return format!("voice session invalid (4006) {reason}");
     }
+    if code == 4017 {
+        return format!("voice socket closed (4017 E2EE/DAVE protocol required) {reason}");
+    }
     format!("voice socket closed ({code} {reason})")
 }
 
@@ -976,12 +994,9 @@ async fn next_op(
         if let Message::Close(frame) = &message {
             return Err(close_error(frame));
         }
-        // Skip DAVE replies during Hello/Ready — only Session Description (op 4)
-        // and the live loop should answer MLS opcodes.
-        if op == 4 {
-            for reply in dave_replies(dave, message.clone()) {
-                let _ = outbound.send(reply);
-            }
+        // Answer DAVE/MLS opcodes at any handshake stage (Ready through Session Description).
+        for reply in dave_replies(dave, message.clone()) {
+            let _ = outbound.send(reply);
         }
         let Message::Text(text) = message else { continue; };
         let value: serde_json::Value = serde_json::from_str(&text).map_err(|err| err.to_string())?;

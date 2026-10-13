@@ -26,6 +26,8 @@ impl TransportMode {
     }
 
     pub fn choose(modes: &[String]) -> Option<Self> {
+        // Prefer Discord's current rtp-size AEAD modes (aead_aes256_gcm_rtpsize /
+        // aead_xchacha20_poly1305_rtpsize). Legacy xsalsa20_poly1305 is not used.
         if modes.iter().any(|mode| mode == "aead_aes256_gcm_rtpsize") {
             Some(Self::Aes256Gcm)
         } else if modes

@@ -117,7 +117,7 @@ fn loop_capture(app: AppHandle, commands: std::sync::mpsc::Receiver<CapCmd>) {
     let mut window_started = Instant::now();
     let mut next_emit = Instant::now();
     // Preview JPEG encode runs off-thread; capture only ships Arc frames (no 4K clone).
-    let (preview_tx, preview_rx) = std::sync::mpsc::sync_channel::<std::sync::Arc<Frame>>(1);
+    let (preview_tx, preview_rx) = std::sync::mpsc::sync_channel::<std::sync::Arc<Frame>>(2);
     let preview_app = app.clone();
     thread::Builder::new()
         .name("suncord-preview".into())
@@ -185,12 +185,17 @@ fn loop_capture(app: AppHandle, commands: std::sync::mpsc::Receiver<CapCmd>) {
         let target_fps = fps.max(1);
         let interval = Duration::from_secs_f64(1.0 / target_fps as f64);
         let tick = Instant::now();
+        let wait = if next_emit > tick {
+            next_emit - tick
+        } else {
+            Duration::ZERO
+        };
 
-        // Only push a preview when WGC delivered a new buffer — re-JPEGing a stale
-        // last_frame at 60 Hz burns CPU and looks choppy when motion finally arrives.
+        // Block briefly for the next WGC frame so we ride the compositor clock (~60 Hz)
+        // instead of spinning on try_recv and only counting sparse desktop updates.
         let mut fresh = false;
         if let Some(stream) = display_stream.as_ref() {
-            if let Some(frame) = stream.drain_latest() {
+            if let Some(frame) = stream.wait_latest(wait.max(Duration::from_millis(1))) {
                 last_frame = Some(frame);
                 fresh = true;
             }
@@ -204,21 +209,17 @@ fn loop_capture(app: AppHandle, commands: std::sync::mpsc::Receiver<CapCmd>) {
             }
         }
 
-        if !fresh {
-            let remain = if next_emit > tick {
-                next_emit - tick
-            } else {
-                Duration::ZERO
-            };
-            if remain > Duration::from_millis(1) {
-                thread::sleep(remain.min(Duration::from_millis(4)));
-            } else {
-                std::hint::spin_loop();
-            }
+        // Pace emits to the target FPS. Re-ship the last buffer when WGC is quiet so
+        // the software cursor stays live without GDI fallback (which tops out ~5 FPS).
+        if !fresh && tick < next_emit {
+            continue;
+        }
+        if !fresh && last_frame.is_none() {
+            thread::sleep(Duration::from_millis(2));
             continue;
         }
 
-        next_emit = tick + interval;
+        next_emit = Instant::now() + interval;
         let Some(frame) = last_frame.clone() else {
             continue;
         };
@@ -294,8 +295,12 @@ impl NativeDisplayStream {
         })
     }
 
-    fn drain_latest(&self) -> Option<Frame> {
-        let mut frame = self.frames.try_recv().ok()?;
+    fn wait_latest(&self, timeout: Duration) -> Option<Frame> {
+        let mut frame = match self.frames.recv_timeout(timeout) {
+            Ok(frame) => frame,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => self.frames.try_recv().ok()?,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return None,
+        };
         while let Ok(newer) = self.frames.try_recv() {
             frame = newer;
         }
@@ -485,8 +490,8 @@ fn emit(app: &AppHandle, stats: CaptureStats) {
 }
 
 fn emit_preview(app: &AppHandle, frame: &Frame) {
-    // 540px JPEG stays under ~20ms encode so the preview worker keeps up with WGC.
-    let max_w = 540u32;
+    // Compact JPEG keeps the off-thread encoder under a frame budget at 60 FPS.
+    let max_w = 720u32;
     let (width, height, rgba) = if frame.width > max_w {
         let width = max_w;
         let height = ((frame.height as u64 * width as u64) / frame.width.max(1) as u64).max(2) as u32;
@@ -512,7 +517,7 @@ fn emit_preview(app: &AppHandle, frame: &Frame) {
     paint_software_cursor(&mut painted, origin_x, origin_y, scale_x, scale_y);
     let rgb = rgba_to_rgb(painted.rgba.as_ref());
     let mut jpeg = Vec::with_capacity((width * height) as usize / 6);
-    let encoder = JpegEncoder::new_with_quality(&mut jpeg, 45);
+    let encoder = JpegEncoder::new_with_quality(&mut jpeg, 55);
     if encoder
         .write_image(&rgb, width, height, ColorType::Rgb8.into())
         .is_ok()

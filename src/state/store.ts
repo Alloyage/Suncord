@@ -180,10 +180,14 @@ export const useApp = create<AppStore>((set) => ({
     })),
 
   replaceMessages: (channelId, messages) =>
-    set((state) => ({
-      messages: { ...state.messages, [channelId]: messages ?? [] },
-      users: mergeUsers(state.users, undefined, undefined, { [channelId]: messages ?? [] }),
-    })),
+    set((state) => {
+      const incoming = messages ?? [];
+      const merged = mergeChannelHistory(state.messages[channelId] ?? [], incoming);
+      return {
+        messages: { ...state.messages, [channelId]: merged },
+        users: mergeUsers(state.users, undefined, undefined, { [channelId]: merged }),
+      };
+    }),
 
   pushMessage: (message) =>
     set((state) => ({
@@ -346,4 +350,24 @@ function upsertMessage(list: ChatMessage[], message: ChatMessage): ChatMessage[]
     if (byNonce >= 0) return list.map((row, index) => (index === byNonce ? { ...message, pending: false } : row));
   }
   return [...list, message].slice(-200);
+}
+
+/** Merge REST history with live gateway messages so focus/channel sync cannot drop newer rows. */
+function mergeChannelHistory(local: ChatMessage[], incoming: ChatMessage[]): ChatMessage[] {
+  if (!incoming.length) return local;
+  if (!local.length) return incoming.slice(-200);
+  const byId = new Map<string, ChatMessage>();
+  for (const row of incoming) byId.set(row.id, row);
+  for (const row of local) {
+    const existing = byId.get(row.id);
+    if (!existing) {
+      byId.set(row.id, row);
+      continue;
+    }
+    // Prefer non-pending / richer payload when ids collide.
+    if (existing.pending && !row.pending) byId.set(row.id, row);
+  }
+  return Array.from(byId.values())
+    .sort((a, b) => a.id.localeCompare(b.id))
+    .slice(-200);
 }

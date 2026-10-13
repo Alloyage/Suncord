@@ -15,14 +15,15 @@ export function CallOverlay() {
   const voice = useApp((state) => state.voice);
   const capture = useApp((state) => state.capture);
   const user = useApp((state) => state.user);
-  const inVoice =
-    Boolean(voice.channelId) && voice.phase !== "idle" && voice.phase !== "error";
+  // Keep the overlay mounted for any non-idle voice session — including transient
+  // reconnect/"error" flaps — so clicks never flash the text-chat surface underneath.
+  const inVoice = Boolean(voice.channelId) && voice.phase !== "idle";
   const sharing = Boolean(capture?.running);
   const [expanded, setExpanded] = useState(true);
 
   useEffect(() => {
     if (inVoice || sharing) setExpanded(true);
-  }, [voice.channelId, sharing]);
+  }, [inVoice, voice.channelId, sharing]);
 
   useEffect(() => {
     const enabled = sharing && (expanded || inVoice);
@@ -435,30 +436,47 @@ function WebGLCapturePreview({ className }: { className?: string }) {
     let unlisten: (() => void) | undefined;
     let cancelled = false;
     let decoding = false;
+    let decodeId = 0;
     let animation = 0;
+    const worker = createJpegDecodeWorker();
     const pumpDecode = () => {
       if (cancelled || decoding) return;
       const frame = latest.current;
       if (!frame) return;
       latest.current = null;
       decoding = true;
+      const id = (decodeId += 1);
+      const apply = (next: ImageBitmap) => {
+        decoding = false;
+        if (cancelled || id !== decodeId) {
+          next.close();
+          return;
+        }
+        bitmap.current?.close();
+        bitmap.current = next;
+        dirty.current = true;
+        if (node.width !== next.width || node.height !== next.height) {
+          node.width = next.width;
+          node.height = next.height;
+        }
+        if (latest.current) pumpDecode();
+      };
+      if (worker) {
+        const onMessage = (event: MessageEvent<{ id: number; bitmap?: ImageBitmap; error?: string }>) => {
+          if (event.data.id !== id) return;
+          worker.removeEventListener("message", onMessage);
+          if (event.data.bitmap) apply(event.data.bitmap);
+          else {
+            decoding = false;
+            if (latest.current) pumpDecode();
+          }
+        };
+        worker.addEventListener("message", onMessage);
+        worker.postMessage({ id, data: frame.pngBase64 });
+        return;
+      }
       decodeJpegBase64(frame.pngBase64)
-        .then((next) => {
-          decoding = false;
-          if (cancelled) {
-            next.close();
-            return;
-          }
-          bitmap.current?.close();
-          bitmap.current = next;
-          dirty.current = true;
-          if (node.width !== next.width || node.height !== next.height) {
-            node.width = next.width;
-            node.height = next.height;
-          }
-          // Immediately start the next pending frame — never wait on vsync to decode.
-          if (latest.current) pumpDecode();
-        })
+        .then(apply)
         .catch(() => {
           decoding = false;
           if (latest.current) pumpDecode();
@@ -497,6 +515,7 @@ function WebGLCapturePreview({ className }: { className?: string }) {
       cancelled = true;
       cancelAnimationFrame(animation);
       unlisten?.();
+      worker?.terminate();
       bitmap.current?.close();
       bitmap.current = null;
       gl.deleteTexture(texture);
@@ -507,16 +526,40 @@ function WebGLCapturePreview({ className }: { className?: string }) {
   return <canvas ref={canvas} className={className ?? "h-full w-full object-contain"} aria-label="Screen share preview" />;
 }
 
+function createJpegDecodeWorker(): Worker | null {
+  if (typeof Worker === "undefined") return null;
+  try {
+    const source = `
+      self.onmessage = async (event) => {
+        const { id, data } = event.data;
+        try {
+          const binary = atob(data);
+          const bytes = new Uint8Array(binary.length);
+          for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+          const bitmap = await createImageBitmap(new Blob([bytes], { type: "image/jpeg" }), {
+            premultiplyAlpha: "none",
+            colorSpaceConversion: "none",
+          });
+          self.postMessage({ id, bitmap }, [bitmap]);
+        } catch (error) {
+          self.postMessage({ id, error: String(error) });
+        }
+      };
+    `;
+    return new Worker(URL.createObjectURL(new Blob([source], { type: "application/javascript" })));
+  } catch {
+    return null;
+  }
+}
+
 function decodeJpegBase64(data: string): Promise<ImageBitmap> {
-  // data: URL decode is faster than atob → Uint8Array → Blob for large JPEGs.
-  return fetch(`data:image/jpeg;base64,${data}`)
-    .then((response) => response.blob())
-    .then((blob) =>
-      createImageBitmap(blob, {
-        premultiplyAlpha: "none",
-        colorSpaceConversion: "none",
-      }),
-    );
+  const binary = atob(data);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
+  return createImageBitmap(new Blob([bytes], { type: "image/jpeg" }), {
+    premultiplyAlpha: "none",
+    colorSpaceConversion: "none",
+  });
 }
 
 function makePreviewProgram(gl: WebGLRenderingContext | WebGL2RenderingContext): WebGLProgram | null {

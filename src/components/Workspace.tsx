@@ -361,8 +361,7 @@ function Sidebar({
   const title = activeGuildId
     ? guilds.find((guild) => guild.id === activeGuildId)?.name ?? "Server"
     : "Direct messages";
-  const inVoice =
-    Boolean(voice.channelId) && voice.phase !== "idle" && voice.phase !== "error";
+  const inVoice = Boolean(voice.channelId) && voice.phase !== "idle";
   const members = voice.members ?? [];
   const micLevel = useLiveMicLevel(settings?.inputDevice ?? "", inVoice && !voice.muted);
 
