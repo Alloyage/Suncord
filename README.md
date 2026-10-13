@@ -55,7 +55,7 @@ Suncord offloads state caching, gateway protocol handling, and media processing 
 
 ## Downloads & Installation
 
-### Option 1: Direct Download (Windows)
+### Option 1: Direct Download (Windows) (NOT YET IMPLEMENTED)
 
 Download the pre-compiled installer from the [Releases](https://github.com/SunSinD/Suncord/releases) page:
 
