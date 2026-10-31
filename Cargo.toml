@@ -1,0 +1,40 @@
+[package]
+name = "suncord-browser"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+suncord-media = { path = "media" }
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio"] }
+base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+futures-util = "0.3"
+parking_lot = "0.12"
+pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
+rand = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["gzip", "json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+syntect = { version = "5.3", default-features = false, features = ["default-syntaxes", "regex-fancy"] }
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-native-roots"] }
+zeroize = "1"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { version = "3", features = ["sync-secret-service"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { version = "3", features = ["windows-native"] }
+windows-sys = { version = "0.61", features = ["Win32_UI_HiDpi"] }
+
+[workspace]
+members = ["media"]
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = true

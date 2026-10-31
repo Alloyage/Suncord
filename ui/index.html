@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Suncord</title>
+    <link rel="icon" href="/icons.svg" type="image/svg+xml" />
+    <link rel="preload" href="/fonts/Inter.woff2" as="font" type="font/woff2" crossorigin />
+    <link rel="stylesheet" href="/app.css" />
+    <link rel="stylesheet" href="/emoji.css" />
+    <script src="/playback.js" defer></script>
+    <script src="/core.js" defer></script>
+    <script src="/composer.js" defer></script>
+    <script src="/timeline.js" defer></script>
+    <script src="/message.js" defer></script>
+    <script src="/sidebar.js" defer></script>
+    <script src="/panels.js" defer></script>
+    <script src="/profile.js" defer></script>
+    <script src="/picker.js" defer></script>
+    <script src="/accounts.js" defer></script>
+    <script src="/voice.js" defer></script>
+    <script src="/app.js" defer></script>
+  </head>
+  <body>
+    <div id="app">
+      <nav id="servers" aria-label="Servers">
+        <button class="sun selected" title="Direct messages" aria-label="Direct messages"><img src="/icons.svg" alt=""></button>
+        <div class="rail-line"></div>
+      </nav>
+      <aside id="sidebar">
+        <header id="workspace"><span id="workspace-name">Suncord</span></header>
+        <nav id="channels" aria-label="Channels"></nav>
+        <footer>
+          <button id="self" class="person">
+            <span class="avatar">Y</span
+            ><span><strong id="username">You</strong></span>
+          </button>
+          <button id="accounts-button" class="icon-button" title="Switch accounts" aria-label="Accounts" aria-haspopup="dialog" aria-controls="account-menu" aria-expanded="false"><svg class="icon" aria-hidden="true"><use href="/icons.svg#accounts"></use></svg></button>
+          <button id="preferences-button" class="icon-button" title="Settings" aria-label="Settings"><svg class="icon" aria-hidden="true"><use href="/icons.svg#settings"></use></svg></button>
+        </footer>
+      </aside>
+      <div
+        id="resize"
+        role="separator"
+        tabindex="0"
+        aria-label="Channel panel width"
+        aria-orientation="vertical"
+        aria-valuemin="180"
+        aria-valuemax="420"
+        aria-valuenow="252"
+      ></div>
+      <main>
+        <header class="toolbar">
+          <span id="channel-symbol" class="hash">#</span>
+          <h1><button id="channel-name" title="Channel details">general</button></h1>
+          <div class="toolbar-actions">
+            <button id="start-call" class="icon-button" hidden title="Start voice call" aria-label="Start voice call"><svg class="icon" aria-hidden="true"><use href="/icons.svg#call"></use></svg></button>
+            <button id="toggle-members" class="icon-button" title="Members" aria-label="Show members" aria-pressed="false"><svg class="icon" aria-hidden="true"><use href="/icons.svg#members"></use></svg></button>
+            <button id="pins-button" class="icon-button" title="Pinned messages" aria-label="Pinned messages" aria-pressed="false"><svg class="icon" aria-hidden="true"><use href="/icons.svg#pin"></use></svg></button>
+            <button id="inbox-button" class="icon-button" title="Mentions" aria-label="Mentions" aria-pressed="false"><svg class="icon" aria-hidden="true"><use href="/icons.svg#inbox"></use></svg></button>
+          </div>
+        </header>
+        <div class="notice"><span id="notice" role="status">Choose an account to connect.</span><button id="reconnect-button" class="icon-button" title="Reconnect" aria-label="Reconnect">↻</button></div>
+        <section id="call" hidden aria-label="Voice call">
+          <button id="call-return" type="button" title="Open call chat"></button>
+          <div id="call-people"></div>
+          <div id="stream-stage" hidden>
+            <canvas id="stream-video" hidden aria-label="Live stream video"></canvas>
+            <p id="playback-status">Waiting for the stream…</p>
+            <div class="stream-controls">
+              <button id="stream-mute" class="icon-button" type="button" title="Mute stream" aria-label="Mute stream" aria-pressed="false"><svg class="icon" aria-hidden="true"><use href="/icons.svg#headphones"></use></svg></button>
+              <button id="stop-watching" class="icon-button" type="button" title="Stop watching" aria-label="Stop watching"><svg class="icon" aria-hidden="true"><use href="/icons.svg#close"></use></svg></button>
+              <button id="stream-fullscreen" class="icon-button" type="button" title="Full screen" aria-label="Full screen"><svg class="icon" aria-hidden="true"><use href="/icons.svg#fullscreen"></use></svg></button>
+            </div>
+          </div>
+          <div id="stream-viewers" hidden></div>
+          <p id="call-status" role="status"></p>
+          <button id="join-call" class="call-watch" type="button" hidden>Join call</button>
+          <div class="call-controls">
+            <button id="mute" class="call-button" type="button" aria-label="Mute microphone" title="Mute"><svg class="icon" aria-hidden="true"><use href="/icons.svg#mic"></use></svg></button>
+            <button id="deafen" class="call-button" type="button" aria-label="Deafen" title="Deafen"><svg class="icon" aria-hidden="true"><use href="/icons.svg#headphones"></use></svg></button>
+            <select id="microphone" aria-label="Microphone" title="Microphone"></select>
+            <button id="share-screen" class="call-button" type="button" aria-label="Share screen" title="Share screen"><svg class="icon" aria-hidden="true"><use href="/icons.svg#screen"></use></svg></button>
+            <select id="stream-source" aria-label="Stream audio" title="Stream audio"><option value="">No stream audio</option></select>
+            <button id="stop-stream" class="call-button" type="button" hidden aria-label="Stop stream" title="Stop stream"><svg class="icon" aria-hidden="true"><use href="/icons.svg#close"></use></svg></button>
+            <button id="leave" class="call-button hangup" type="button" aria-label="Disconnect" title="Disconnect"><svg class="icon" aria-hidden="true"><use href="/icons.svg#hangup"></use></svg></button>
+          </div>
+        </section>
+        <p id="history-status" class="history-status" role="status"></p>
+        <section id="timeline" tabindex="0" aria-label="Messages">
+          <div id="messages"></div>
+        </section>
+        <button id="latest" hidden title="Jump to latest" aria-label="Jump to latest"><svg class="icon" aria-hidden="true"><use href="/icons.svg#arrow-down"></use></svg></button>
+        <section id="compose" aria-label="Message composer">
+          <div id="draft-context" hidden></div>
+          <div id="file-list"></div>
+          <p id="typing" class="typing" role="status"></p>
+          <div id="suggestions" role="listbox" aria-label="Mention suggestions" hidden></div>
+          <form id="composer">
+            <button id="attach" class="icon-button" type="button" title="Upload files" aria-label="Upload files"><svg class="icon" aria-hidden="true"><use href="/icons.svg#attachment"></use></svg></button>
+            <div id="draft" role="textbox" aria-multiline="true" aria-label="Message general" data-placeholder="Message general" spellcheck="true" tabindex="0"></div>
+            <button id="gif-button" class="icon-button" type="button" title="Select GIF" aria-label="GIFs"><svg class="icon" aria-hidden="true"><use href="/icons.svg#gif"></use></svg></button>
+            <button id="sticker-button" class="icon-button" type="button" title="Select sticker" aria-label="Stickers"><svg class="icon" aria-hidden="true"><use href="/icons.svg#sticker"></use></svg></button>
+            <button id="emoji-button" class="icon-button" type="button" title="Select emoji" aria-label="Emoji"><span class="emoji-face"></span></button>
+            <button id="send" class="sr-only" tabindex="-1" type="submit" aria-label="Send message">Send</button>
+          </form>
+          <span id="composer-hint"></span>
+          <input id="file-input" type="file" multiple hidden />
+          <p id="status" role="status"></p>
+        </section>
+      </main>
+      <aside id="members" aria-label="Members" hidden>
+        <h2 class="sr-only">Members</h2>
+        <div id="member-list"></div>
+      </aside>
+      <aside id="message-panel" aria-label="Message panel" hidden></aside>
+      <div id="panel-resize" role="separator" tabindex="0" aria-label="Side panel width" aria-orientation="vertical" aria-valuemin="220" aria-valuemax="520" aria-valuenow="260"></div>
+    </div>
+    <div id="incoming-call" role="dialog" aria-labelledby="incoming-name" hidden>
+      <span id="incoming-name" role="alert"></span>
+      <button id="incoming-join" type="button">Join</button>
+      <button id="incoming-ignore" type="button">Ignore</button>
+    </div>
+    <div id="account-menu" popover="auto" role="dialog" aria-labelledby="accounts-title">
+      <h2 id="accounts-title">Switch accounts</h2>
+      <div id="account-list"></div>
+      <button id="login">+ Add account</button>
+      <a id="login-link" target="_blank" rel="noopener noreferrer" hidden
+        >Continue on discord.com ↗</a
+      >
+      <button id="cancel-login" hidden>Cancel sign-in</button>
+      <button id="disconnect-account">Disconnect account</button>
+      <button id="resume-network">Resume paused account</button>
+      <p id="account-status" role="status"></p>
+    </div>
+  </body>
+</html>

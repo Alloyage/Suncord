@@ -1,0 +1,26 @@
+--- a/src/gst/gstpipewiresrc.c
++++ b/src/gst/gstpipewiresrc.c
+@@ -1656,16 +1656,18 @@
+ 
+     if (GST_CLOCK_TIME_IS_VALID (current_clock_time) &&
+         GST_CLOCK_TIME_IS_VALID (pwsrc->last_buffer_clock_time) &&
+-        GST_CLOCK_TIME_IS_VALID (GST_BUFFER_PTS (*buffer)) &&
+-        GST_CLOCK_TIME_IS_VALID (GST_BUFFER_DTS (*buffer))) {
++        GST_CLOCK_TIME_IS_VALID (GST_BUFFER_PTS (*buffer))) {
+       GstClockTime diff;
+ 
+       diff = current_clock_time - pwsrc->last_buffer_clock_time;
+ 
+       GST_BUFFER_PTS (*buffer) += diff;
+-      GST_BUFFER_DTS (*buffer) += diff;
+-    } else {
+-      GST_BUFFER_PTS (*buffer) = GST_BUFFER_DTS (*buffer) = current_clock_time;
++      if (GST_CLOCK_TIME_IS_VALID (GST_BUFFER_DTS (*buffer)))
++        GST_BUFFER_DTS (*buffer) += diff;
++    } else if (GST_CLOCK_TIME_IS_VALID (current_clock_time)) {
++      GstClockTime base_time = gst_element_get_base_time (GST_ELEMENT_CAST (pwsrc));
++      GST_BUFFER_PTS (*buffer) = GST_BUFFER_DTS (*buffer) =
++          current_clock_time >= base_time ? current_clock_time - base_time : 0;
+     }
+ 
+     GST_LOG_OBJECT (pwsrc, "Sending keepalive buffer pts/dts: %" GST_TIME_FORMAT

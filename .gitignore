@@ -1,0 +1,6 @@
+target/
+*.log
+.DS_Store
+result
+result-*
+.direnv/
